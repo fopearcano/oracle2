@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -744,6 +745,44 @@ class AutostartTest(unittest.TestCase):
             text = oracle.autostart_content()
             self.assertIn("start --no-browser", text)
             self.assertIn(str(ROOT / "oracle.py"), text)
+
+
+class HiddenStarterTest(TempDirCase):
+    """start-oracle-hidden.vbs runs only on Windows, so this checks what it relies on:
+    the port in oracle.config.json and the dashboard's answer, matched with its own patterns."""
+
+    VBS = ROOT / "start-oracle-hidden.vbs"
+
+    def vbs_string(self, line_start: str) -> str:
+        """A string literal from the script, with VBScript's doubled quotes undone."""
+        line = next(ln for ln in self.VBS.read_text(encoding="ascii").splitlines() if line_start in ln)
+        literal = re.search(r'"((?:[^"]|"")*)"(?!")', line[line.index(line_start) + len(line_start):]).group(1)
+        return literal.replace('""', '"')
+
+    def test_plain_ascii_with_windows_line_ends_and_no_window(self):
+        text = self.VBS.read_text(encoding="ascii")          # VBScript files are read as ANSI
+        self.assertIn("*.vbs text eol=crlf", (ROOT / ".gitattributes").read_text())
+        self.assertIn('& " start" & args, 0, False', text)   # window style 0: hidden; don't wait
+        self.assertIn('python = "pyw -3"', text)
+
+    def test_it_finds_the_port_and_recognises_the_dashboard(self):
+        cfg = oracle.load_config()
+        cfg["port"] = 8899
+        oracle.save_config(cfg)
+        pattern = self.vbs_string("re.Pattern = ")
+        m = re.search(pattern, (self.tmp / "oracle.config.json").read_text(encoding="utf-8"))
+        self.assertEqual(m.group(1), "8899")
+
+        port = free_port()
+        sup = oracle.Supervisor(self.db, {}, oracle.load_config(), dashboard_port=port, quiet=True)
+        httpd = oracle.make_dashboard(sup, port)
+        import threading
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with opener.open(f"http://127.0.0.1:{port}/api/status", timeout=5) as resp:
+            body = resp.read().decode("utf-8")
+        self.assertIn(self.vbs_string("InStr(http.responseText, "), body)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ cd oracle
 
    The dashboard opens in your browser. Ctrl+C stops Oracle and every atlas it started. The first start of an app with a build step takes a minute or two (see [Apps with a build step](#apps-with-a-build-step)); after that they start at once.
 
-On macOS you can double-click `start-oracle.command`. On Windows, double-click `start-oracle.bat`.
+On macOS you can double-click `start-oracle.command`. On Windows, double-click `start-oracle.bat`, which keeps a console window open while Oracle runs, or `start-oracle-hidden.vbs`, which starts Oracle in the background with no window (see [Starting Oracle in the background](#starting-oracle-in-the-background-on-windows)).
 
 ## The atlases
 
@@ -202,6 +202,12 @@ To stop the background Oracle and all its atlases, use **Quit Oracle** on the da
 ```bash
 python3 oracle.py stop
 ```
+
+### Starting Oracle in the background on Windows
+
+Double-click `start-oracle-hidden.vbs`. It starts Oracle with no window and opens the dashboard, or just opens the dashboard if Oracle is already running. It needs Python's `pyw` launcher (it comes with the installer from python.org) or `pythonw`. For an icon on the desktop, right-click the file and choose *Send to > Desktop (create shortcut)*; add ` --no-browser` at the end of the shortcut's *Target* to start Oracle without opening the browser.
+
+Oracle writes its messages to `logs\oracle.log`. If the dashboard doesn't answer within 30 seconds, for example because something else uses port 8800, the script shows the end of that log.
 
 ## Using it from a phone or another computer
 
