@@ -1,6 +1,7 @@
 # Your atlases, settings and logs stay on your computer
 /db/
 /logs/
+/state/
 /oracle.config.json
 /oracle.config.json.tmp
 __pycache__/

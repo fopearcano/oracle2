@@ -96,13 +96,19 @@
   .pill { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: var(--c, var(--idle)); }
   .pill i { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
   .s-running { --c: var(--ok); }
-  .s-starting, .s-installing, .s-syncing { --c: var(--warn); }
-  .s-starting .pill i, .s-installing .pill i, .s-syncing .pill i { animation: pulse 1s ease-in-out infinite; }
-  .s-external { --c: var(--info); }
-  .s-crashed, .s-error { --c: var(--bad); }
+  .s-starting, .s-installing, .s-building, .s-queued, .s-syncing { --c: var(--warn); }
+  .s-starting .pill i, .s-installing .pill i, .s-building .pill i, .s-syncing .pill i, .busy .pill i { animation: pulse 1s ease-in-out infinite; }
+  .s-queued .pill i { opacity: .55; }
+  .s-external, .s-untrusted { --c: var(--info); }
+  .s-crashed, .s-error, .s-failed { --c: var(--bad); }
   @keyframes pulse { 50% { opacity: .25; } }
   @media (prefers-reduced-motion: reduce) { .pill i { animation: none !important; } }
   .port { font-family: var(--mono); font-size: 12.5px; color: var(--muted); }
+  .top-right { display: inline-flex; align-items: center; gap: 8px; }
+  .badge { font-size: 11.5px; font-weight: 650; padding: 2px 7px; border-radius: 99px; background: var(--surface-2); color: var(--accent); border: 1px solid var(--line); }
+  .note { margin: 2px 0 0; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+  .note b { font-weight: 600; color: var(--text); }
+  .elapsed { font-variant-numeric: tabular-nums; }
   .card h3 { margin: 4px 0 0; font-size: 17px; letter-spacing: -.005em; }
   .meta { margin: 0; font-size: 12.5px; color: var(--muted); font-family: var(--mono); }
   .about { margin: 2px 0 0; color: var(--muted); font-size: 13.5px;
@@ -163,7 +169,8 @@
     <div class="actions">
       <button class="primary" data-global="start-selected" title="Start every atlas that has Autostart on">Start selected</button>
       <button data-global="stop-all">Stop all</button>
-      <button data-global="rescan" title="Look for atlases added to the folder">Rescan folder</button>
+      <button data-global="update-all" title="Get the latest version of every app from GitHub, rebuild what changed and restart the ones that run">Update all</button>
+      <button data-global="rescan" title="Look for atlases added to the folder, and ask GitHub which ones have updates">Rescan folder</button>
       <button class="quiet danger" data-global="shutdown" id="quit" title="Stop every atlas and quit Oracle">Quit Oracle</button>
     </div>
   </header>
@@ -186,7 +193,8 @@
 
   <footer id="footer">
     Autostart decides which atlases start with Oracle. To start Oracle itself when you log in, run
-    <code>python3 oracle.py autostart on</code>.
+    <code>python3 oracle.py autostart on</code>. <b>Update</b> gets the latest version from GitHub,
+    rebuilds the app if it needs a build, and restarts it if it was running.
   </footer>
 </div>
 
@@ -206,10 +214,17 @@
   const codeify = (s) => esc(s).replace(/`([^`]+)`/g, "<code>$1</code>");
 
   const LABEL = {
-    running: "Running", starting: "Starting", installing: "Installing", syncing: "Downloading",
-    external: "Already running", stopped: "Stopped", crashed: "Crashed", error: "Can't start", missing: "Not in folder",
+    running: "Running", starting: "Starting", installing: "Installing", building: "Building", queued: "Waiting to build",
+    syncing: "Downloading", external: "Already running", stopped: "Stopped", crashed: "Crashed", error: "Can't start",
+    failed: "Failed", untrusted: "Needs a first start", missing: "Not in folder",
   };
-  const KIND = { static: "static site", node: "node server", npm: "npm app", cmd: "custom command" };
+  const KIND = { static: "static site", node: "node server", npm: "npm app", cmd: "custom command", server: "server" };
+  const FRAMEWORK = {
+    vite: "Vite", next: "Next.js", nuxt: "Nuxt", sveltekit: "SvelteKit", astro: "Astro", remix: "Remix",
+    "react-router": "React Router", "create-react-app": "Create React App", gatsby: "Gatsby", "vue-cli": "Vue CLI",
+    angular: "Angular", parcel: "Parcel",
+  };
+  const BUSY = ["starting", "installing", "building", "queued", "syncing"];
 
   let last = "";
   let data = null;
@@ -253,6 +268,20 @@
     toast.h = setTimeout(() => t.classList.remove("show"), 3200);
   }
 
+  function duration(s) {
+    if (s == null) return "";
+    if (s < 60) return `${s} s`;
+    if (s < 3600) return `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, "0")} s`;
+    return `${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")} min`;
+  }
+
+  function kindLabel(a) {
+    const fw = FRAMEWORK[a.framework];
+    if (a.kind === "static" && a.build) return fw ? `${fw} site, built` : "static site, built";
+    if (a.kind === "server") return fw ? `${fw} server` : "server";
+    return (KIND[a.kind] || "unknown") + (a.build ? ", built" : "");
+  }
+
   function uptime(s) {
     if (s == null) return "";
     if (s < 60) return "just started";
@@ -261,37 +290,60 @@
     return `up ${Math.floor(s / 86400)} d`;
   }
 
+  function pill(a, updating) {
+    if (updating && a.state === "running") return "Running · updating";
+    if (a.state === "failed") return /^Install/.test(a.message || "") ? "Install failed" : "Build failed";
+    if (a.state === "syncing" && updating) return "Updating";
+    return LABEL[a.state] || a.state;
+  }
+
   function card(a) {
     const live = a.state === "running" || a.state === "external";
-    const busy = ["starting", "installing", "syncing"].includes(a.state);
+    const updating = a.task === "updating";
+    const busy = BUSY.includes(a.state) || updating;
+    const n = esc(a.name);
+    const upd = a.update && a.update.available;
     const btn = [];
     if (live) btn.push(`<a class="btn primary" href="${esc(atlasUrl(a.port))}" target="_blank" rel="noopener">Open</a>`);
-    if (a.present && !live && !busy && a.state !== "error") btn.push(`<button class="primary" data-act="start" data-name="${esc(a.name)}">Start</button>`);
-    if (a.state === "running" || a.state === "starting" || a.state === "installing") btn.push(`<button data-act="stop" data-name="${esc(a.name)}">Stop</button>`);
-    if (a.state === "running" || a.state === "crashed") btn.push(`<button class="quiet" data-act="restart" data-name="${esc(a.name)}">Restart</button>`);
-    if (a.state === "error" && a.present) btn.push(`<button class="quiet" data-act="start" data-name="${esc(a.name)}">Try again</button>`);
-    if (!a.present && a.repo && a.state !== "syncing") btn.push(`<button class="primary" data-act="download" data-name="${esc(a.name)}" title="git clone github.com/${esc(a.repo)}">Download</button>`);
-    if (a.has_log) btn.push(`<button class="quiet" data-log="${esc(a.name)}">Log</button>`);
+    if (a.present && !live && !busy && !["error", "failed", "untrusted"].includes(a.state)) btn.push(`<button class="primary" data-act="start" data-name="${n}">Start</button>`);
+    if (a.state === "untrusted") btn.push(`<button class="primary" data-act="start" data-name="${n}" title="Install and build it this once; Oracle remembers that you allowed it">Start</button>`);
+    if (["running", "starting", "installing", "building", "queued"].includes(a.state)) btn.push(`<button data-act="stop" data-name="${n}">Stop</button>`);
+    if ((a.state === "running" || a.state === "crashed") && !updating) btn.push(`<button class="quiet" data-act="restart" data-name="${n}">Restart</button>`);
+    if (a.state === "error" && a.present) btn.push(`<button class="quiet" data-act="start" data-name="${n}">Try again</button>`);
+    if (a.state === "failed") btn.push(`<button class="primary" data-act="start" data-name="${n}">Retry</button>`);
+    if (a.present && a.git && !busy) btn.push(`<button class="${upd ? "primary" : "quiet"}" data-act="update" data-name="${n}" title="Get the latest version from GitHub${a.update && a.update.branch ? ` (${esc(a.update.branch)})` : ""}, rebuild it if needed and restart it if it runs">Update</button>`);
+    if (!a.present && a.repo && a.state !== "syncing") btn.push(`<button class="primary" data-act="download" data-name="${n}" title="git clone github.com/${esc(a.repo)}">Download</button>`);
+    if (a.has_log) btn.push(`<button class="quiet" data-log="${n}">Log</button>`);
 
     let msg = a.message;
-    if (a.state === "running") msg = uptime(a.uptime);
+    if (a.state === "running") msg = updating ? "Checking GitHub for updates…" : uptime(a.uptime);
+    if (a.state === "building") msg = `\`${a.message}\``;
     if (!a.present && a.state === "missing") msg = a.repo ? `Not in the folder yet. Download clones github.com/${a.repo}.` : "Not in the folder.";
+    // how long it has been installing or building (there is no time limit)
+    const long = ["queued", "installing", "building"].includes(a.state) || (a.state === "starting" && a.elapsed >= 5);
+    const clock = a.elapsed != null && long ? `<span class="elapsed">${msg ? " · " : ""}${duration(a.elapsed)}</span>` : "";
+    const msgHtml = msg || clock ? `<p class="msg">${codeify(msg)}${clock}</p>` : "";
 
-    const meta = [a.name, KIND[a.kind] || "unknown", a.auto_port ? "port picked by Oracle" : ""].filter(Boolean).join(" · ");
+    let note = "";
+    if (a.note) note = `<p class="note">Last update: ${esc(a.note)}</p>`;
+    if (upd && !busy) note += `<p class="note"><b>Update available</b>${a.update.switch ? ` (switches to ${esc(a.update.branch)})` : ` (${esc(a.update.local)} → ${esc(a.update.remote)})`}</p>`;
+
+    const meta = [a.name, kindLabel(a), a.auto_port ? "port picked by Oracle" : ""].filter(Boolean).join(" · ");
     return `
-      <article class="card s-${esc(a.state)}${a.present ? "" : " missing"}">
+      <article class="card s-${esc(a.state)}${a.present ? "" : " missing"}${updating ? " busy" : ""}">
         <div class="card-top">
-          <span class="pill"><i></i>${esc(LABEL[a.state] || a.state)}</span>
-          <span class="port">${a.port ? ":" + esc(a.port) : ""}</span>
+          <span class="pill"><i></i>${esc(pill(a, updating))}</span>
+          <span class="top-right">${upd && !busy ? `<span class="badge" title="GitHub has a newer version">Update</span>` : ""}<span class="port">${a.port ? ":" + esc(a.port) : ""}</span></span>
         </div>
         <h3>${esc(a.title)}</h3>
         <p class="meta">${esc(meta)}</p>
         ${a.about ? `<p class="about">${esc(a.about)}</p>` : ""}
-        ${msg ? `<p class="msg">${codeify(msg)}</p>` : ""}
+        ${msgHtml}
+        ${note}
         <div class="card-bottom">
           <div class="btns">${btn.join("")}</div>
           <label class="switch" title="Start this one whenever Oracle starts">
-            <input type="checkbox" data-select="${esc(a.name)}" ${a.selected ? "checked" : ""}>
+            <input type="checkbox" data-select="${n}" ${a.selected ? "checked" : ""}>
             <span class="track"></span>Autostart
           </label>
         </div>
@@ -299,7 +351,7 @@
   }
 
   function render(d) {
-    const key = JSON.stringify(d.atlases.map(({ uptime, ...rest }) => ({ ...rest, up: rest.state === "running" ? Math.floor((uptime || 0) / 60) : 0 })).concat([d.db, d.lan_ip, d.client, d.remote_url, d.access_code]));
+    const key = JSON.stringify(d.atlases.map(({ uptime, ...rest }) => ({ ...rest, up: rest.state === "running" ? Math.floor((uptime || 0) / 60) : 0 })).concat([d.db, d.lan_ip, d.client, d.remote_url, d.access_code, d.checking]));
     if (key === last) return;
     last = key;
 
@@ -318,12 +370,17 @@
     const present = d.atlases.filter((a) => a.present);
     const missing = d.atlases.filter((a) => !a.present);
     const running = present.filter((a) => a.state === "running" || a.state === "external").length;
-    const problems = present.filter((a) => a.state === "error" || a.state === "crashed").length;
+    const problems = present.filter((a) => ["error", "crashed", "failed"].includes(a.state)).length;
     const auto = present.filter((a) => a.selected).length;
+    const updates = present.filter((a) => a.update && a.update.available).length;
+    const building = present.filter((a) => ["installing", "building", "queued"].includes(a.state)).length;
 
     $("#summary").innerHTML = [
       `<span><b>${running}</b> of ${present.length} running</span>`,
       `<span><b>${auto}</b> start automatically</span>`,
+      building ? `<span><b>${building}</b> installing or building, one at a time</span>` : "",
+      updates ? `<span style="color:var(--accent)"><b style="color:inherit">${updates}</b> ${updates === 1 ? "update" : "updates"} available</span>` : "",
+      d.checking ? `<span>asking GitHub for updates…</span>` : "",
       problems ? `<span style="color:var(--bad)"><b style="color:inherit">${problems}</b> need attention</span>` : "",
     ].join("");
 
@@ -399,12 +456,15 @@
       const what = g.dataset.global;
       if (what === "shutdown" && !confirm("Stop every atlas and quit Oracle?")) return;
       if (what === "stop-all") toast("Stopping every atlas…");
+      if (what === "update-all") toast("Updating every app from GitHub, one at a time…");
+      if (what === "rescan") toast("Rescanning the folder and asking GitHub for updates…");
       return act(`/api/${what}`);
     }
     const b = ev.target.closest("[data-act]");
     if (b) {
       b.disabled = true;
       if (b.dataset.act === "download") toast("Downloading from GitHub…");
+      if (b.dataset.act === "update") toast("Updating from GitHub…");
       return act(`/api/atlas/${encodeURIComponent(b.dataset.name)}/${b.dataset.act}`);
     }
     const l = ev.target.closest("[data-log]");

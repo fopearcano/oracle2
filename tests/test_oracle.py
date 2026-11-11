@@ -51,6 +51,7 @@ class TempDirCase(unittest.TestCase):
         patches = [
             mock.patch.object(oracle, "CONFIG_FILE", self.tmp / "oracle.config.json"),
             mock.patch.object(oracle, "LOG_DIR", self.tmp / "logs"),
+            mock.patch.object(oracle, "STATE_DIR", self.tmp / "state"),
         ]
         for p in patches:
             p.start()

@@ -96,6 +96,89 @@
       "entry": "server.js",
       "port": 4134,
       "branch": "claude/optimistic-pascal-4630j3"
+    },
+    {
+      "name": "astrum",
+      "title": "Astrum",
+      "group": "Atlases",
+      "about": "Astrophysics in twelve interactive plates, from the scale of the cosmos to the expansion of the Universe, drawn from real catalogues.",
+      "kind": "static",
+      "build": true,
+      "root": "dist",
+      "port": 5120
+    },
+    {
+      "name": "universe-map",
+      "title": "Universe Map",
+      "group": "Atlases",
+      "about": "A 3D map of the universe you can fly through: the Solar System to scale, 100,000 nearby stars and the cosmos out to the microwave background.",
+      "kind": "static",
+      "build": true,
+      "root": "dist",
+      "port": 5333
+    },
+    {
+      "name": "qtr-v2",
+      "title": "QTR System",
+      "group": "Atlases",
+      "about": "The fifteen codices of the QTR universe: its physics, cartography, timelines, bestiary and languages.",
+      "kind": "static",
+      "port": 8006
+    },
+    {
+      "name": "outliner",
+      "title": "Outliner",
+      "group": "Writing tools",
+      "about": "A private, local-first outliner in the style of Dynalist, with a dark VS Code look. Your notes stay in this browser.",
+      "kind": "static",
+      "build": true,
+      "root": "dist",
+      "port": 5273
+    },
+    {
+      "name": "draftist",
+      "title": "Draftist",
+      "group": "Writing tools",
+      "about": "A writing workspace for novelists: one continuous manuscript with an outline, a searchable story bible, comments and paper, sepia or night views.",
+      "kind": "static",
+      "build": true,
+      "root": "dist",
+      "port": 5146,
+      "branch": "codex/build-draftist-with-enhanced-editing-features"
+    },
+    {
+      "name": "orchestrator",
+      "title": "Storyline",
+      "group": "Writing tools",
+      "about": "A timeline plotter for stories. Projects are saved as .storyline files in the app's projects folder.",
+      "kind": "cmd",
+      "cmd": ["{python}", "-B", "-c", "import app; app.run('{host}', {port})"],
+      "port": 5000,
+      "branch": "codex/build-python-web-app-for-timeline-plotter"
+    },
+    {
+      "name": "vdc-spiral",
+      "title": "Spiral",
+      "group": "Writing tools",
+      "about": "A story relationship diagram: characters on intimacy circles, a golden-ratio spiral and Fibonacci arms, exported as PNG.",
+      "kind": "cmd",
+      "cmd": ["{python}", "app.py", "--host", "{host}", "--port", "{port}"],
+      "port": 8003,
+      "branch": "codex/create-interactive-spiral-diagram-in-python"
+    },
+    {
+      "name": "persona2",
+      "title": "PERSONA 2",
+      "group": "Writing tools",
+      "about": "A local-first lab for persistent AI characters built with McKee's method, talking through LM Studio or another LLM (in Italian by default).",
+      "kind": "npm",
+      "build": true,
+      "output": "web/dist",
+      "port": 4317,
+      "env": {
+        "PERSONA_PORT": "{port}",
+        "PERSONA_HOST": "{host}"
+      }
     }
   ]
 }

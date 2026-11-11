@@ -10,7 +10,7 @@ them, and `oracle.py autostart on` makes it run every time you log in.
     python3 oracle.py list             what is in the folder, and what runs
     python3 oracle.py select NAME...   start these automatically
     python3 oracle.py deselect NAME... stop starting these automatically
-    python3 oracle.py sync [NAME...]   download or update atlases from GitHub
+    python3 oracle.py sync [NAME...]   download atlases from GitHub, or update them
     python3 oracle.py config --db DIR  remember which folder holds the atlases
     python3 oracle.py config --lan on  open atlases + dashboard to your network
     python3 oracle.py autostart on     run Oracle when you log in
@@ -19,12 +19,13 @@ them, and `oracle.py autostart on` makes it run every time you log in.
     python3 oracle.py doctor [--fix]   why can't my phone reach it? (and fix the firewall)
 
 Only the Python standard library is used (Python 3.8 or newer). Atlases with
-a server of their own need Node.js; `sync` needs git.
+a server of their own, or with a build step, need Node.js; `sync` needs git.
 """
 
 from __future__ import annotations
 
 import argparse
+import collections
 import functools
 import hashlib
 import hmac
@@ -32,6 +33,7 @@ import ipaddress
 import json
 import os
 import platform
+import posixpath
 import re
 import secrets
 import shlex
@@ -46,15 +48,16 @@ import webbrowser
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
-VERSION = "1.1.0"
+VERSION = "2.0.0"
 HERE = Path(__file__).resolve().parent
 REGISTRY_FILE = HERE / "atlases.json"
 CONFIG_FILE = HERE / "oracle.config.json"
 DASHBOARD_FILE = HERE / "dashboard.html"
 LOG_DIR = HERE / "logs"
+STATE_DIR = HERE / "state"      # build stamps and the apps you allowed to build (not in git)
 DEFAULT_DB = HERE / "db"
 DEFAULT_PORT = 8800
 FIRST_FREE_PORT = 8100          # where ports for atlases Oracle doesn't know start
@@ -82,8 +85,12 @@ CGNAT = ipaddress.ip_network("100.64.0.0/10")         # Tailscale and similar VP
 
 # --------------------------------------------------------------------- utils
 
+_print_lock = threading.Lock()
+
+
 def say(msg: str) -> None:
-    print(f"[oracle] {msg}", flush=True)
+    with _print_lock:                    # runners report from their own threads
+        print(f"[oracle] {msg}", flush=True)
 
 
 def read_json(path: Path):
@@ -92,6 +99,13 @@ def read_json(path: Path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def read_text(path: Path, limit: int = 200_000) -> str:
@@ -401,20 +415,135 @@ def port_in_file(path: Path):
     return int(m.group(1)) if m else None
 
 
+def read_package(folder: Path) -> dict:
+    pkg = read_json(folder / "package.json")
+    return pkg if isinstance(pkg, dict) else {}
+
+
+def package_scripts(pkg: dict) -> dict:
+    return pkg["scripts"] if isinstance(pkg.get("scripts"), dict) else {}
+
+
+def all_dependencies(pkg: dict) -> dict:
+    deps = {}
+    for key in ("devDependencies", "optionalDependencies", "dependencies"):
+        if isinstance(pkg.get(key), dict):
+            deps.update(pkg[key])
+    return deps
+
+
+def config_text(folder: Path, stem: str) -> str:
+    """The text of vite.config.ts, next.config.mjs, ... (whichever exists)."""
+    for ext in (".ts", ".mts", ".js", ".mjs", ".cjs", ".json"):
+        text = read_text(folder / (stem + ext), 100_000)
+        if text:
+            return text
+    return ""
+
+
+def vite_out_dir(folder: Path) -> str:
+    m = re.search(r"\boutDir\s*:\s*['\"`]([^'\"`]+)['\"`]", config_text(folder, "vite.config"))
+    return m.group(1).strip("/").replace("\\", "/") if m else "dist"
+
+
+def vite_port(folder: Path):
+    """The port in vite.config (preview first): the app's data in the browser is tied to it."""
+    text = config_text(folder, "vite.config")
+    m = (re.search(r"\bpreview\s*:\s*\{[^{}]*?\bport\s*:\s*(\d{2,5})\b", text, re.S)
+         or re.search(r"\bport\s*:\s*(\d{2,5})\b", text))
+    return int(m.group(1)) if m else None
+
+
+# A start script that only runs a dev server or a static file server: the
+# app's real output is what the build produces.
+DEV_START = re.compile(r"^\s*(?:npx\s+)?(?:vite|react-scripts\s+start|vue-cli-service\s+serve|parcel|"
+                       r"webpack(?:-dev-server|\s+serve)|serve|http-server|live-server|astro\s+(?:dev|preview)|"
+                       r"ng\s+serve|gatsby\s+(?:develop|serve)|next\s+dev|(?:nuxt|nuxi)\s+dev|svelte-kit\s+dev)\b")
+
+
+def detect_build(folder: Path, pkg: dict):
+    """How to run an app whose package.json has a `build` script.
+
+    Static output (Vite, Create React App, static Astro, ...) is served by
+    Oracle from the output folder; a server (Next.js, Nuxt, SvelteKit with
+    adapter-node, Remix, ...) is started with Oracle's port and host.
+    """
+    scripts = package_scripts(pkg)
+    build = str(scripts.get("build") or "")
+    if not build:
+        return None
+    deps = all_dependencies(pkg)
+    start = str(scripts.get("start") or "")
+    m = PORT_IN_SCRIPT.search(f"{start} {scripts.get('serve') or ''}")
+    port = int(m.group(1)) if m else port_in_readme(folder)
+
+    def static(root, framework=None, own_port=None):
+        return {"kind": "static", "root": root, "build": True, "framework": framework, "port": own_port or port}
+
+    def server(framework):
+        return {"kind": "server", "framework": framework, "build": True, "port": port}
+
+    if "next" in deps:
+        if re.search(r"\boutput\s*:\s*['\"`]export['\"`]", config_text(folder, "next.config")) or "next export" in build:
+            return static("out", "next")
+        return server("next")
+    if "nuxt" in deps:
+        return static(".output/public", "nuxt") if re.search(r"\b(?:nuxt|nuxi)\s+generate\b", build) else server("nuxt")
+    if "@sveltejs/kit" in deps:
+        if "@sveltejs/adapter-node" in deps:
+            return server("sveltekit")
+        if "@sveltejs/adapter-static" in deps:
+            m = re.search(r"\bpages\s*:\s*['\"`]([^'\"`]+)['\"`]", config_text(folder, "svelte.config"))
+            return static(m.group(1) if m else "build", "sveltekit")
+        spec = server("sveltekit")
+        spec["unsupported"] = ("SvelteKit apps need @sveltejs/adapter-node (a server) or @sveltejs/adapter-static "
+                               "(static files) to run on this computer: switch the adapter in svelte.config.js")
+        return spec
+    if "astro" in deps:
+        return server("astro") if "@astrojs/node" in deps else static("dist", "astro")
+    if "@remix-run/serve" in deps or "@remix-run/dev" in deps:
+        return server("remix")
+    if "@react-router/serve" in deps:
+        return server("react-router")
+
+    # The app's own server, built first.
+    m = NODE_ENTRY.match(start)
+    if m and (folder / m.group(1)).is_file():
+        return {"kind": "node", "entry": m.group(1), "build": True,
+                "port": port_in_file(folder / m.group(1)) or port}
+    if start and not DEV_START.match(start) and not PORT_IN_SCRIPT.search(start):
+        return {"kind": "npm", "build": True, "port": port}
+
+    if "vite" in deps:
+        return static(vite_out_dir(folder), "vite", vite_port(folder))
+    if "react-scripts" in deps:
+        return static("build", "create-react-app")
+    if "gatsby" in deps:
+        return static("public", "gatsby")
+    if "@vue/cli-service" in deps:
+        return static("dist", "vue-cli")
+    if "@angular/core" in deps:
+        return static(None, "angular")         # dist/<project>/browser, found after the build
+    if "parcel" in deps:
+        return static("dist", "parcel")
+    return static(None)                        # dist/, build/, out/ or the folder itself
+
+
 def detect(folder: Path):
     """Work out how to start an atlas that atlases.json doesn't list.
 
     Returns a spec such as {"kind": "static", "port": 8010} or None when the
     folder does not look like a web app.
     """
-    pkg = read_json(folder / "package.json")
-    pkg = pkg if isinstance(pkg, dict) else {}
-    scripts = pkg.get("scripts") if isinstance(pkg.get("scripts"), dict) else {}
+    pkg = read_package(folder)
+    scripts = package_scripts(pkg)
     start = str(scripts.get("start") or "")
-    spec = None
+    spec = detect_build(folder, pkg)
 
     m = PORT_IN_SCRIPT.search(f"{start} {scripts.get('serve') or ''}")
-    if m and (folder / "index.html").is_file():
+    if spec is not None:
+        pass
+    elif m and (folder / "index.html").is_file():
         spec = {"kind": "static", "port": int(m.group(1))}
     elif NODE_ENTRY.match(start) and (folder / NODE_ENTRY.match(start).group(1)).is_file():
         entry = NODE_ENTRY.match(start).group(1)
@@ -437,13 +566,33 @@ def detect(folder: Path):
     return spec
 
 
+def git_dir(folder: Path):
+    """The .git folder of a clone (a worktree or submodule has a .git file pointing to it)."""
+    dot = folder / ".git"
+    if dot.is_dir():
+        return dot
+    m = re.match(r"gitdir:\s*(.+)", read_text(dot, 2000).strip())
+    if m:
+        target = Path(m.group(1).strip())
+        return target if target.is_absolute() else (folder / target).resolve()
+    return None
+
+
+def git_origin_url(folder: Path) -> str:
+    """The URL a clone came from (its "origin"), or ""."""
+    gd = git_dir(folder)
+    text = read_text(gd / "config", 50_000) if gd else ""
+    if not text and gd and (gd / "commondir").is_file():      # a worktree: the config is shared
+        text = read_text((gd / read_text(gd / "commondir").strip() / "config").resolve(), 50_000)
+    m = re.search(r'\[remote "origin"\][^\[]*?url\s*=\s*(\S+)', text) or re.search(r"url\s*=\s*(\S+)", text)
+    return m.group(1) if m else ""
+
+
 def git_remote_repo(folder: Path) -> str:
     """Name of the GitHub repository a clone came from ("lit-atlas"), or ""."""
-    text = read_text(folder / ".git" / "config", 50_000)
-    m = re.search(r'\[remote "origin"\][^\[]*?url\s*=\s*(\S+)', text) or re.search(r"url\s*=\s*(\S+)", text)
-    if not m:
+    url = git_origin_url(folder).rstrip("/")
+    if not url:
         return ""
-    url = m.group(1).rstrip("/")
     if url.endswith(".git"):
         url = url[:-4]
     return re.split(r"[/:]", url)[-1].lower()
@@ -459,11 +608,20 @@ class Atlas:
         self.about = spec.get("about") or ""
         self.kind = spec.get("kind")
         self.port = spec.get("port")
-        self.root = spec.get("root") or "."
+        self.root = spec.get("root")       # static: the folder served (None: found after the build)
         self.entry = spec.get("entry")
         self.cmd = spec.get("cmd")
         self.repo = spec.get("repo")
         self.branch = spec.get("branch")
+        # true, false, the name of a package.json script, or a command list
+        self.build = spec.get("build")
+        self.framework = spec.get("framework")
+        self.output = spec.get("output")   # what a build makes, for server apps (checked before a start)
+        self.env = spec["env"] if isinstance(spec.get("env"), dict) else {}
+        self.spa = spec.get("spa")
+        self.unsupported = spec.get("unsupported")
+        self.git = path is not None and (path / ".git").exists()
+        self.origin = git_origin_url(path) if self.git else ""
         self.auto_port = False
         self.problem = None
 
@@ -471,28 +629,44 @@ class Atlas:
     def url(self) -> str:
         return f"http://localhost:{self.port}/"
 
+    @property
+    def wants_build(self) -> bool:
+        return bool(self.build) and self.build is not False
+
 
 def find_problem(a: Atlas):
     if a.path is None:
         return "not in the folder"
+    if a.unsupported:
+        return a.unsupported
+    needs_pkg = a.wants_build and not isinstance(a.build, list)
     if a.kind == "static":
-        if not (a.path / a.root / "index.html").is_file():
-            return f"no index.html in {a.path / a.root}"
+        if a.wants_build:
+            if needs_pkg and not (a.path / "package.json").is_file():
+                return "package.json is missing, so there is nothing to build"
+        elif not (a.path / (a.root or ".") / "index.html").is_file():
+            return f"no index.html in {a.path / (a.root or '.')}"
     elif a.kind == "node":
         if not a.entry or not (a.path / a.entry).is_file():
             msg = f"{a.entry or 'the server script'} is missing"
             if a.branch:
                 msg += (f": this app lives on the '{a.branch}' branch."
-                        f" Run `python3 oracle.py sync {a.name}` to switch to it")
+                        f" Press Update, or run `python3 oracle.py sync {a.name}`, to switch to it")
             return msg
-    elif a.kind == "npm":
+    elif a.kind in ("npm", "server"):
         if not (a.path / "package.json").is_file():
-            return "package.json is missing"
+            msg = "package.json is missing"
+            if a.branch:
+                msg += (f": this app lives on the '{a.branch}' branch."
+                        f" Press Update, or run `python3 oracle.py sync {a.name}`, to switch to it")
+            return msg
     elif a.kind == "cmd":
         if not isinstance(a.cmd, list) or not a.cmd:
             return "\"cmd\" must be a list such as [\"python3\", \"serve.py\", \"{port}\"]"
     else:
         return "Oracle doesn't know how to start it (no \"kind\" in atlases.json)"
+    if a.build is not None and not isinstance(a.build, (bool, str, list)):
+        return "\"build\" must be true, false, the name of a package.json script, or a command list"
     return None
 
 
@@ -582,23 +756,6 @@ def engine_problem(folder: Path, node: str):
     return None
 
 
-def needs_install(folder: Path) -> bool:
-    """True when package.json lists dependencies that node_modules lacks or is older than."""
-    pkg = read_json(folder / "package.json") or {}
-    if not pkg.get("dependencies"):
-        return False
-    marker = folder / "node_modules" / ".package-lock.json"   # written by every npm install
-    if not marker.is_file():
-        return True
-    newest = 0.0
-    for name in ("package.json", "package-lock.json"):
-        try:
-            newest = max(newest, (folder / name).stat().st_mtime)
-        except OSError:
-            pass
-    return newest > marker.stat().st_mtime
-
-
 class LaunchError(Exception):
     pass
 
@@ -610,23 +767,400 @@ def need_program(name: str, hint: str) -> str:
     return path
 
 
+NODE_HINT = "install Node.js from https://nodejs.org"
+
+# The lockfile tells which package manager an app uses.
+LOCKFILES = (("package-lock.json", "npm"), ("npm-shrinkwrap.json", "npm"), ("pnpm-lock.yaml", "pnpm"),
+             ("yarn.lock", "yarn"), ("bun.lockb", "bun"), ("bun.lock", "bun"))
+# Files an install leaves in node_modules (the first is Oracle's own).
+INSTALL_MARKERS = ("node_modules/.oracle-installed", "node_modules/.package-lock.json", "node_modules/.modules.yaml",
+                   "node_modules/.yarn-integrity", "node_modules/.yarn-state.yml", ".yarn/install-state.gz")
+
+
+def package_manager(folder: Path):
+    """("npm" | "pnpm" | "yarn" | "bun", the lockfile's name or None)."""
+    for name, pm in LOCKFILES:
+        if (folder / name).is_file():
+            return pm, name
+    declared = str(read_package(folder).get("packageManager") or "").split("@")[0]
+    return (declared if declared in ("npm", "pnpm", "yarn", "bun") else "npm"), None
+
+
+def yarn_berry(folder: Path) -> bool:
+    """Yarn 2 or newer (as opposed to Yarn 1, "classic")."""
+    declared = str(read_package(folder).get("packageManager") or "")
+    return ((folder / ".yarnrc.yml").is_file() or bool(re.match(r"yarn@(?:[2-9]|\d\d)", declared))
+            or "__metadata:" in read_text(folder / "yarn.lock", 4000))
+
+
+def pm_program(folder: Path):
+    """(package manager, the command that runs it), e.g. ("pnpm", ["/usr/bin/corepack", "pnpm"])."""
+    pm, lock = package_manager(folder)
+    if pm == "npm":
+        return pm, [need_program("npm", NODE_HINT)]
+    source = lock or "the packageManager field in package.json"
+    if pm == "bun":
+        raise LaunchError(f"this app uses Bun ({source}), which Oracle doesn't support. Ask for a "
+                          "package-lock.json in the repository (run `npm install` there and commit it), "
+                          "or give it a \"cmd\" in atlases.json")
+    corepack = shutil.which("corepack")       # comes with Node.js; it fetches the right pnpm or yarn
+    if corepack:
+        return pm, [corepack, pm]
+    direct = shutil.which(pm)
+    if direct:
+        return pm, [direct]
+    raise LaunchError(f"this app uses {pm} ({source}), which isn't installed. Node.js up to version 24 "
+                      f"comes with Corepack, which provides it: run `corepack enable`. Or install it "
+                      f"with `npm install -g {pm}`")
+
+
+def install_commands(folder: Path, pm: str, prefix: list) -> list:
+    """The install command, then a fallback for a lockfile that is out of date.
+
+    Neither changes the lockfile, so `git pull` keeps working afterwards.
+    """
+    _, lock = package_manager(folder)
+    quiet = ["--no-audit", "--no-fund"]
+    if pm == "npm":
+        loose = prefix + ["install", "--no-save", "--include=dev"] + quiet
+        return [prefix + ["ci", "--include=dev"] + quiet, loose] if lock else [loose]
+    if pm == "pnpm":
+        return [prefix + ["install", "--frozen-lockfile"], prefix + ["install", "--no-frozen-lockfile"]]
+    if yarn_berry(folder):
+        return [prefix + ["install", "--immutable"], prefix + ["install"]]
+    return [prefix + ["install", "--frozen-lockfile", "--production=false"], prefix + ["install", "--production=false"]]
+
+
+def has_dependencies(pkg: dict) -> bool:
+    return bool(all_dependencies(pkg) or pkg.get("workspaces"))
+
+
+def needs_install(folder: Path) -> bool:
+    """True when package.json lists packages (dev ones too) that are missing, or
+    package.json or the lockfile changed since they were installed."""
+    if not has_dependencies(read_package(folder)):
+        return False
+    installed = 0.0
+    for name in INSTALL_MARKERS:
+        try:
+            installed = max(installed, (folder / name).stat().st_mtime)
+        except OSError:
+            pass
+    if not installed:
+        return True
+    newest = 0.0
+    for name in ["package.json"] + [lock for lock, _ in LOCKFILES]:
+        try:
+            newest = max(newest, (folder / name).stat().st_mtime)
+        except OSError:
+            pass
+    return newest > installed
+
+
+def mark_installed(folder: Path) -> None:
+    if (folder / "node_modules").is_dir():
+        try:
+            (folder / INSTALL_MARKERS[0]).write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def build_env(env: dict) -> dict:
+    """Installs and builds never run as production: that would skip devDependencies (Vite, TypeScript...)."""
+    env = {k: v for k, v in env.items() if k.upper() != "NODE_ENV"}
+    env["COREPACK_ENABLE_DOWNLOAD_PROMPT"] = "0"    # corepack would otherwise wait for a "y"
+    return env
+
+
+def fill(template, values: dict) -> str:
+    return str(template).format(**values)
+
+
+def build_command(a: Atlas, values: dict) -> list:
+    """`npm run build` (or pnpm/yarn), another script named in atlases.json, or a command list."""
+    if isinstance(a.build, list):
+        cmd = [fill(part, values) for part in a.build]
+        if cmd and not os.path.isabs(cmd[0]):
+            cmd[0] = need_program(cmd[0], "it is the first word of this app's \"build\" in atlases.json")
+        return cmd
+    script = a.build if isinstance(a.build, str) and a.build else "build"
+    if script not in package_scripts(read_package(a.path)):
+        raise LaunchError(f"package.json has no \"{script}\" script to build it with")
+    return pm_program(a.path)[1] + ["run", script]
+
+
+def show_command(cmd: list) -> str:
+    """A command for the log, with the full path of npm, node... shortened to its name."""
+    if not cmd:
+        return ""
+    program = re.split(r"[\\/]", str(cmd[0]))[-1]          # the same on Windows and elsewhere
+    parts = [re.sub(r"\.(cmd|exe|bat)$", "", program, flags=re.I)] + [str(c) for c in cmd[1:]]
+    return " ".join(shlex.quote(p) if re.search(r"\s", p) else p for p in parts)
+
+
+# ---------------------------------------------------------- build stamps
+#
+# After a successful build Oracle notes what it built: the git commit, any
+# uncommitted changes, the lockfile and the build command. The next start
+# rebuilds only when one of these changed or the output is gone.
+
+OUTPUT_DIRS = ("dist", "build", "out", ".output/public")
+NOT_SOURCE = {"node_modules", ".git", "dist", "build", "out", ".output", ".next", ".nuxt", ".svelte-kit",
+              ".astro", ".cache", ".vite", ".turbo", ".parcel-cache", "coverage", "__pycache__"}
+SERVER_OUTPUT = {"next": ".next/BUILD_ID", "nuxt": ".output/server/index.mjs",
+                 "sveltekit": "build/index.js", "astro": "dist/server/entry.mjs"}
+
+
+def stamp_path(name: str) -> Path:
+    return STATE_DIR / "builds" / (re.sub(r"[^\w.-]+", "_", name) + ".json")
+
+
+def read_stamp(name: str):
+    data = read_json(stamp_path(name))
+    return data if isinstance(data, dict) else None
+
+
+def file_hash(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def git_out(args, cwd: Path) -> str:
+    code, text = git(args, cwd=cwd, timeout=60)
+    return text if code == 0 else ""
+
+
+def tree_fingerprint(folder: Path, limit: int = 20000) -> str:
+    """For a folder that isn't a git clone: the size and age of its source files."""
+    count, size, newest = 0, 0, 0.0
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d not in NOT_SOURCE and not d.startswith(".")]
+        for name in files:
+            try:
+                st = os.stat(os.path.join(root, name))
+            except OSError:
+                continue
+            count, size, newest = count + 1, size + st.st_size, max(newest, st.st_mtime)
+            if count >= limit:
+                return f"{count}+/{size}/{int(newest)}"
+    return f"{count}/{size}/{int(newest)}"
+
+
+def build_stamp(a: Atlas, command: list) -> dict:
+    stamp = {"path": str(a.path), "command": show_command(command), "commit": None, "changes": None}
+    if a.git:
+        stamp["commit"] = git_out(["rev-parse", "HEAD"], a.path).strip() or None
+        diff = git_out(["diff", "HEAD", "--no-color", "--no-ext-diff"], a.path)
+        stamp["changes"] = hashlib.sha256(diff.encode("utf-8", "replace")).hexdigest()[:16] if diff.strip() else ""
+    else:
+        stamp["changes"] = tree_fingerprint(a.path)
+    _, lock = package_manager(a.path)
+    stamp["lockfile"] = file_hash(a.path / (lock or "package.json"))
+    return stamp
+
+
+def static_root(a: Atlas):
+    """The folder Oracle serves for a static app, or None when a build hasn't made it yet."""
+    if a.root:
+        return a.root
+    if not a.wants_build:
+        return "."
+    for cand in OUTPUT_DIRS:
+        if (a.path / cand / "index.html").is_file():
+            return cand
+    for pattern in ("dist/*/browser/index.html", "dist/*/index.html"):     # Angular
+        found = sorted(a.path.glob(pattern))
+        if found:
+            return found[0].parent.relative_to(a.path).as_posix()
+    if (a.path / "index.html").is_file() and not a.framework:
+        return "."                       # a build that makes data for a plain site
+    return None
+
+
+def build_output_ok(a: Atlas) -> bool:
+    if a.kind == "static":
+        root = static_root(a)
+        return bool(root) and (a.path / root / "index.html").is_file()
+    if a.output:
+        out = a.path / a.output
+        return out.is_file() or (out.is_dir() and any(out.iterdir()))
+    marker = SERVER_OUTPUT.get(a.framework) if a.kind == "server" else None
+    return (a.path / marker).exists() if marker else True
+
+
+def build_reason(a: Atlas, command: list):
+    """Why the app must be built before it starts, or None when the last build still holds."""
+    if not a.wants_build:
+        return None
+    old = read_stamp(a.name)
+    if not old:
+        return "first build"
+    if not build_output_ok(a):
+        return "the build output is missing"
+    new = build_stamp(a, command)
+    if old.get("path") != new["path"]:
+        return "the app is in another folder now"
+    if old.get("command") != new["command"]:
+        return "the build command changed"
+    if old.get("commit") != new["commit"]:
+        return f"new code ({(old.get('commit') or '?')[:7]} -> {(new['commit'] or '?')[:7]})"
+    if old.get("changes") != new["changes"]:
+        return "the code changed since the last build"
+    if old.get("lockfile") != new["lockfile"]:
+        return "the dependencies changed"
+    return None
+
+
+def save_stamp(a: Atlas, command: list) -> None:
+    stamp = build_stamp(a, command)
+    stamp["built_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    write_json(stamp_path(a.name), stamp)
+
+
+class BuildQueue:
+    """Lets one install or build run at a time, first come first served, so that
+    starting everything at login doesn't overload the computer."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.waiting = collections.deque()
+        self.holder = None
+
+    def _ready(self, owner) -> bool:
+        return self.holder is None and bool(self.waiting) and self.waiting[0] is owner
+
+    def acquire(self, owner, cancelled=lambda: False, on_wait=None) -> bool:
+        """Wait for the turn of `owner`; False when `cancelled()` became true meanwhile."""
+        with self.cond:
+            self.waiting.append(owner)
+            ready = self._ready(owner)
+        if not ready and on_wait:
+            on_wait()
+        with self.cond:
+            try:
+                while not self._ready(owner):
+                    if cancelled():
+                        return False
+                    self.cond.wait(0.2)
+                self.holder = owner
+                return True
+            finally:
+                if owner in self.waiting:
+                    self.waiting.remove(owner)
+                self.cond.notify_all()
+
+    def release(self, owner) -> None:
+        with self.cond:
+            if self.holder is owner:
+                self.holder = None
+                self.cond.notify_all()
+
+
+# ------------------------------------------------------------ trusted apps
+#
+# Installing and building run the repository's own scripts. Apps listed in
+# atlases.json may do that by themselves; an app Oracle found on its own must
+# be started once by hand first.
+
+TRUST_LOCK = threading.Lock()
+
+
+def trust_file() -> Path:
+    return STATE_DIR / "trusted.json"
+
+
+def is_trusted(a: Atlas) -> bool:
+    if a.known:
+        return True
+    data = read_json(trust_file())
+    entry = data.get(str(a.path)) if isinstance(data, dict) and a.path else None
+    return isinstance(entry, dict) and entry.get("origin", "") == a.origin
+
+
+def trust(a: Atlas) -> None:
+    if a.known or a.path is None:
+        return
+    with TRUST_LOCK:
+        data = read_json(trust_file())
+        data = data if isinstance(data, dict) else {}
+        data[str(a.path)] = {"name": a.name, "origin": a.origin, "since": time.strftime("%Y-%m-%d %H:%M:%S")}
+        write_json(trust_file(), data)
+
+
+# ------------------------------------------------------------ servers of frameworks
+
+def node_bin(folder: Path, package: str, name=None):
+    """The JavaScript file behind node_modules/.bin/<name>, run with node directly
+    (no .cmd shim, so no console window on Windows)."""
+    meta = read_json(folder / "node_modules" / package / "package.json")
+    bins = meta.get("bin") if isinstance(meta, dict) else None
+    if isinstance(bins, dict):
+        rel = bins.get(name or package) or next(iter(bins.values()), None)
+    else:
+        rel = bins
+    if not isinstance(rel, str):
+        return None
+    path = folder / "node_modules" / package / rel
+    return path if path.is_file() else None
+
+
+def server_command(a: Atlas, host: str, node: str):
+    """How to run a framework's production server on Oracle's port and host:
+    (command, extra environment). None: `npm start`, with PORT and HOST."""
+    port = str(a.port)
+    if a.framework == "next":
+        nb = node_bin(a.path, "next")
+        if not nb:
+            raise LaunchError("Next.js isn't in node_modules: the install didn't finish, see the log")
+        return [node, str(nb), "start", "-p", port, "-H", host], {}           # next start ignores HOST
+    if a.framework == "nuxt":
+        return [node, ".output/server/index.mjs"], {"NITRO_PORT": port, "NITRO_HOST": host}
+    if a.framework == "sveltekit":
+        # adapter-node reads HOST and PORT; ORIGIN keeps form actions working
+        return [node, "build/index.js"], ({} if os.environ.get("ORIGIN") else {"ORIGIN": f"http://localhost:{port}"})
+    if a.framework == "astro":
+        return [node, "dist/server/entry.mjs"], {}                            # @astrojs/node reads HOST and PORT
+    return None                                     # remix-serve, react-router-serve, ... read PORT and HOST
+
+
 # ------------------------------------------------------------------- runner
 
-ACTIVE = ("installing", "starting", "running", "syncing")
+# States an app goes through while it starts: queued (waiting for another
+# app's install or build), installing, building, starting, running.
+ACTIVE = ("queued", "installing", "building", "starting", "running", "syncing")
+PHASES = ("queued", "installing", "building", "starting")
+GLOBAL_QUEUE = BuildQueue()
+
+
+class Prep:
+    """What a start has to do first: install, build, or nothing."""
+
+    def __init__(self):
+        self.installs = []            # the install command, then its fallback
+        self.build = None             # the build command
+        self.reason = None            # why it must be built now
+        self.env = {}
 
 
 class Runner:
-    """One atlas process: starts it, watches it, stops it."""
+    """One atlas process: installs and builds it if needed, starts it, watches it, stops it."""
 
-    def __init__(self, atlas: Atlas, host: str, on_change=None):
+    def __init__(self, atlas: Atlas, host: str, on_change=None, queue=None):
         self.atlas = atlas
         self.host = host
         self.on_change = on_change
+        self.queue = queue or GLOBAL_QUEUE
         self.lock = threading.Lock()
         self.proc = None
         self.stopping = False
         self.started_at = None
+        self.phase_at = time.time()       # when the current state began
         self.gen = 0                      # bumped on every start; older runs go quiet
+        self.task = None                  # "updating" while git works on the clone
+        self.note = ""                    # how the last update went
+        self.update_info = None           # {"available": bool, ...} from the last check
         self.state, self.message = "stopped", ""
         self.reset()
 
@@ -636,7 +1170,7 @@ class Runner:
 
     @property
     def active(self) -> bool:
-        return self.state in ACTIVE or self.proc is not None
+        return self.state in ACTIVE or self.proc is not None or self.task is not None
 
     def reset(self) -> None:
         """Show an idle atlas as stopped, missing or broken."""
@@ -647,58 +1181,189 @@ class Runner:
             self.state, self.message = "error", a.problem
         else:
             self.state, self.message = "stopped", ""
+        self.phase_at = time.time()
+
+    def notify(self) -> None:
+        if self.on_change:
+            self.on_change(self)
 
     def set(self, state: str, message: str = "", gen=None) -> None:
         with self.lock:
             if gen is not None and gen != self.gen:
                 return
             changed = (state, message) != (self.state, self.message)
+            if state != self.state:
+                self.phase_at = time.time()
             self.state, self.message = state, message
-        if changed and self.on_change:
-            self.on_change(self)
+        if changed:
+            self.notify()
 
-    def start(self) -> None:
+    def begin_task(self, task: str) -> bool:
+        """Mark the runner busy with git work; False when it is busy already."""
         with self.lock:
-            if self.state in ACTIVE or self.proc is not None:
-                return
+            if self.task or self.state in ("queued", "installing", "building", "starting", "syncing"):
+                return False
+            self.task = task
+        self.notify()
+        return True
+
+    def end_task(self) -> None:
+        with self.lock:
+            self.task = None
+        self.notify()
+
+    def start(self, manual: bool = False) -> bool:
+        """Start the app. `manual` is a start by hand (dashboard button, --only), which
+        allows an app Oracle found by itself to install and build."""
+        with self.lock:
+            if self.state in ACTIVE or self.proc is not None or self.task:
+                return False
             self.stopping = False
             self.gen += 1
             gen = self.gen
-            self.state, self.message = "starting", ""
-        threading.Thread(target=self._run, args=(gen,), name=f"run-{self.atlas.name}", daemon=True).start()
+            self.state, self.message, self.phase_at = "starting", "", time.time()
+        threading.Thread(target=self._run, args=(gen, manual), name=f"run-{self.atlas.name}", daemon=True).start()
+        return True
+
+    def values(self) -> dict:
+        a = self.atlas
+        return {"port": a.port, "host": self.host, "python": sys.executable, "dir": str(a.path)}
+
+    def base_env(self) -> dict:
+        env = dict(os.environ, PORT=str(self.atlas.port), HOST=self.host)
+        values = self.values()
+        for key, value in self.atlas.env.items():
+            env[str(key)] = fill(value, values)
+        return env
+
+    def prepare(self) -> Prep:
+        """Work out whether the app needs an install or a build before it starts."""
+        a = self.atlas
+        prep = Prep()
+        uses_npm = (a.path / "package.json").is_file() and (
+            a.kind in ("node", "npm", "server") or (a.wants_build and not isinstance(a.build, list)))
+        if a.wants_build:
+            prep.build = build_command(a, self.values())
+            prep.reason = build_reason(a, prep.build)
+        if uses_npm:
+            node = need_program("node", NODE_HINT)
+            problem = engine_problem(a.path, node)
+            if problem:
+                raise LaunchError(problem)
+            # A built static site is served without node_modules: install only to build it.
+            if needs_install(a.path) and (a.kind != "static" or prep.reason):
+                pm, prefix = pm_program(a.path)
+                prep.installs = install_commands(a.path, pm, prefix)
+        prep.env = build_env(self.base_env())
+        return prep
 
     def command(self):
         a = self.atlas
-        env = dict(os.environ, PORT=str(a.port), HOST=self.host)
+        env = self.base_env()
         if a.kind == "static":
-            root = str((a.path / a.root).resolve())
-            return [sys.executable, str(HERE / "oracle.py"), "serve-static", root,
-                    "--port", str(a.port), "--host", self.host], env
+            root = static_root(a)
+            if not root or not (a.path / root / "index.html").is_file():
+                where = f"{root}/" if root else "dist/, build/ or out/"
+                raise LaunchError(f"there is no index.html in {where}: if the build puts it elsewhere, "
+                                  "set \"root\" for this app in atlases.json")
+            cmd = [sys.executable, str(HERE / "oracle.py"), "serve-static", str((a.path / root).resolve()),
+                   "--port", str(a.port), "--host", self.host]
+            if a.spa or (a.spa is None and a.wants_build):
+                cmd.append("--spa")
+            return cmd, env
         if a.kind == "node":
-            node = need_program("node", "install Node.js from https://nodejs.org")
+            node = need_program("node", NODE_HINT)
             problem = engine_problem(a.path, node)
             if problem:
                 raise LaunchError(problem)
             return [node, a.entry], env
-        if a.kind == "npm":
-            return [need_program("npm", "install Node.js from https://nodejs.org"), "start"], env
+        if a.kind in ("npm", "server"):
+            if a.kind == "server":
+                found = server_command(a, self.host, need_program("node", NODE_HINT))
+                if found:
+                    env.update(found[1])
+                    return found[0], env
+            return pm_program(a.path)[1] + ["start"], env
         if a.kind == "cmd":
-            values = {"port": a.port, "host": self.host, "python": sys.executable, "dir": str(a.path)}
-            cmd = [str(part).format(**values) for part in a.cmd]
+            cmd = [fill(part, self.values()) for part in a.cmd]
             if not os.path.isabs(cmd[0]):
                 cmd[0] = need_program(cmd[0], "it is the first word of this atlas's \"cmd\"")
             return cmd, env
         raise LaunchError(a.problem or "unknown kind")
 
-    def _spawn(self, cmd, env, log):
+    def _spawn(self, cmd, env, log, gen):
         with self.lock:
-            if self.stopping:
+            if self.stopping or gen != self.gen:
                 return None
             self.proc = subprocess.Popen(cmd, cwd=str(self.atlas.path), env=env, stdin=subprocess.DEVNULL,
                                          stdout=log, stderr=subprocess.STDOUT, **spawn_flags())
             return self.proc
 
-    def _run(self, gen: int) -> None:
+    def _step(self, cmd, env, log, gen, why: str = ""):
+        """Run an install or build to its end, its output going to the log.
+        The exit code, or None when the app was stopped meanwhile."""
+        log.write(("$ " + show_command(cmd) + (f"    ({why})" if why else "") + "\n").encode())
+        log.flush()
+        proc = self._spawn(cmd, env, log, gen)
+        if proc is None:
+            return None
+        code = proc.wait()
+        with self.lock:
+            self.proc = None
+            stopped = self.stopping or gen != self.gen
+        log.write(f"[oracle] exit code {code}\n".encode())
+        log.flush()
+        return None if stopped else code
+
+    def _prepare_and_build(self, prep: Prep, log, gen, set_):
+        """Install and build, holding the build queue. True to go on and start."""
+        a = self.atlas
+
+        def waiting():
+            set_("queued", "waiting for another app to finish installing or building")
+        if not self.queue.acquire(self, cancelled=lambda: self.stopping or gen != self.gen, on_wait=waiting):
+            set_("stopped")
+            return False
+        try:
+            if prep.installs:
+                words = show_command(prep.installs[0]).split(" ")
+                label = " ".join(words[1:3] if words[0] == "corepack" else words[:2])      # "npm ci"
+                set_("installing", f"{label}: needed only when package.json or the lockfile changes")
+                code = self._step(prep.installs[0], prep.env, log, gen)
+                for fallback in prep.installs[1:]:
+                    if code in (None, 0):
+                        break
+                    log.write(b"[oracle] that failed; trying again without a frozen lockfile\n")
+                    code = self._step(fallback, prep.env, log, gen)
+                if code is None:
+                    set_("stopped")
+                    return False
+                if code != 0:
+                    set_("failed", f"Install failed ({label}): open the log")
+                    return False
+                mark_installed(a.path)
+                if prep.build:
+                    prep.reason = build_reason(a, prep.build)
+            if prep.build and prep.reason:
+                set_("building", show_command(prep.build))
+                code = self._step(prep.build, prep.env, log, gen, why=prep.reason)
+                if code is None:
+                    set_("stopped")
+                    return False
+                if code != 0:
+                    set_("failed", "Build failed: open the log")
+                    return False
+                if not build_output_ok(a):
+                    where = a.root or a.output or "dist/, build/ or out/"
+                    set_("failed", f"The build finished but made nothing in {where}: open the log, or set "
+                                   "\"root\" in atlases.json")
+                    return False
+                save_stamp(a, prep.build)
+            return True
+        finally:
+            self.queue.release(self)
+
+    def _run(self, gen: int, manual: bool = False) -> None:
         a = self.atlas
         set_ = functools.partial(self.set, gen=gen)
         if a.problem:
@@ -707,30 +1372,30 @@ class Runner:
             return set_("external", f"something was already answering on port {a.port}, "
                                         "so Oracle left it alone")
         try:
-            cmd, env = self.command()
+            prep = self.prepare()
         except LaunchError as e:
             return set_("error", str(e))
+        if prep.installs or prep.reason:
+            if manual:
+                trust(a)
+            elif not is_trusted(a):
+                steps = " and ".join(x for x in ("installing its packages" if prep.installs else "",
+                                                 "building it" if prep.reason else "") if x)
+                return set_("untrusted", f"Oracle found this app by itself, and {steps} would run the "
+                                         "repository's own scripts. Start it once by hand to allow that")
 
         log = open_log(self.log_path)
         try:
-            if a.kind in ("node", "npm") and needs_install(a.path):
-                npm = shutil.which("npm")
-                if not npm:
-                    return set_("error", "npm was not found: install Node.js from https://nodejs.org")
-                set_("installing", "installing dependencies (npm install), only needed once")
-                log.write(b"$ npm install\n")
-                log.flush()
-                proc = self._spawn([npm, "install", "--no-audit", "--no-fund"], env, log)
-                code = proc.wait() if proc else None
-                with self.lock:
-                    self.proc = None
-                if proc is None or self.stopping:
-                    return set_("stopped")
-                if code != 0:
-                    return set_("error", "npm install failed: open the log to see why")
-            log.write(("$ " + " ".join(cmd) + "\n").encode())
+            if (prep.installs or prep.reason) and not self._prepare_and_build(prep, log, gen, set_):
+                return
+            try:
+                cmd, env = self.command()
+            except LaunchError as e:
+                return set_("error", str(e))
+            set_("starting", "")
+            log.write(("$ " + show_command(cmd) + "\n").encode())
             log.flush()
-            proc = self._spawn(cmd, env, log)
+            proc = self._spawn(cmd, env, log, gen)
         except OSError as e:
             with self.lock:
                 self.proc = None
@@ -741,7 +1406,6 @@ class Runner:
             return set_("stopped")
 
         self.started_at = time.time()
-        set_("starting", "")
         slow_at = time.time() + 30
         while proc.poll() is None and not port_open(a.port):
             if time.time() > slow_at:
@@ -762,106 +1426,307 @@ class Runner:
         with self.lock:
             self.stopping = True
             proc = self.proc
-            if proc is None and self.state in ("starting", "crashed"):
-                self.gen += 1                 # a run that hasn't spawned yet gives up
-                self.state, self.message = "stopped", ""
+            if proc is None and self.state in ("starting", "queued", "crashed"):
+                self.gen += 1                 # a run that hasn't spawned anything yet gives up
+                self.state, self.message, self.phase_at = "stopped", "", time.time()
         if proc is not None:
             kill_tree(proc)
             for _ in range(100):           # let _run() record the exit
                 if self.proc is None:
                     break
                 time.sleep(0.05)
+        self.notify()
 
     def info(self, selected: bool) -> dict:
         a = self.atlas
         state, message = self.state, self.message
         if state == "external" and not port_open(a.port):
             state, message = "stopped", ""
+        if self.task == "updating" and state not in ("running", "external"):
+            state, message = "syncing", "updating from GitHub"
         uptime = int(time.time() - self.started_at) if state == "running" and self.started_at else None
+        elapsed = int(time.time() - self.phase_at) if state in PHASES else None
         return {
             "name": a.name, "title": a.title, "group": a.group, "about": a.about,
             "kind": a.kind, "port": a.port, "url": a.url, "auto_port": a.auto_port,
             "present": a.path is not None, "path": str(a.path) if a.path else None,
             "known": a.known, "repo": a.repo, "branch": a.branch,
-            "selected": selected, "state": state, "message": message, "uptime": uptime,
+            "build": a.wants_build, "framework": a.framework, "git": a.git,
+            "selected": selected, "state": state, "message": message, "uptime": uptime, "elapsed": elapsed,
+            "task": self.task, "note": self.note, "update": self.update_info,
             "has_log": self.log_path.is_file(),
         }
 
 
 # --------------------------------------------------------------- git sync
 
-def git(args, cwd=None):
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+def git(args, cwd=None, timeout: float = 600):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", LC_ALL="C")
     try:
-        r = subprocess.run(["git"] + args, cwd=cwd, env=env, capture_output=True, text=True,
-                           timeout=600, **NO_WINDOW)
+        r = subprocess.run(["git"] + args, cwd=None if cwd is None else str(cwd), env=env, capture_output=True,
+                           text=True, errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **NO_WINDOW)
     except (OSError, subprocess.SubprocessError) as e:
         return 1, str(e)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
-def remote_has_branch(remote: str, branch: str, cwd=None) -> bool:
-    code, out = git(["ls-remote", "--heads", remote, branch], cwd=cwd)
-    return code == 0 and bool(out.strip())
+def last_line(text: str, default: str) -> str:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    return re.sub(r"^(fatal|error):\s*", "", lines[-1]) if lines else default
 
 
-def git_sync(a: Atlas, db: Path, out=say):
-    """Clone a missing atlas into the db folder, or fast-forward an existing clone."""
-    if not shutil.which("git"):
-        return False, "git is not installed"
-    if not a.repo:
-        return False, "atlases.json gives no GitHub repository for it"
-    url = f"https://github.com/{a.repo}.git"
+def parse_ls_remote(text: str) -> dict:
+    """`git ls-remote --symref REMOTE HEAD ...` -> {"default": "main", "heads": {"main": sha, ...}}."""
+    default, head, heads = None, None, {}
+    for line in text.splitlines():
+        m = re.match(r"ref:\s*refs/heads/(\S+)\s+HEAD\s*$", line)
+        if m:
+            default = m.group(1)
+            continue
+        parts = line.split()
+        if len(parts) == 2 and re.fullmatch(r"[0-9a-f]{40,64}", parts[0]):
+            if parts[1] == "HEAD":
+                head = parts[0]
+            elif parts[1].startswith("refs/heads/"):
+                heads[parts[1][len("refs/heads/"):]] = parts[0]
+    if default and head:
+        heads.setdefault(default, head)
+    return {"default": default, "heads": heads}
 
-    if a.path is None:
-        dest = db / a.name
-        if dest.exists():
-            return False, f"{dest} already exists but is not an atlas Oracle recognises"
-        db.mkdir(parents=True, exist_ok=True)
-        args = ["clone"]
-        if a.branch and remote_has_branch(url, a.branch):
-            args += ["--branch", a.branch]
-        out(f"{a.name}: cloning {a.repo} into {dest}")
-        code, text = git(args + [url, str(dest)])
-        return (True, "downloaded") if code == 0 else (False, text.splitlines()[-1] if text else "git clone failed")
 
-    dest = a.path
-    if not (dest / ".git").exists():
-        return False, f"{dest} is not a git clone, so it was left as it is"
-    # The writing tools keep their app on a side branch; switch a clone that has
-    # only the default branch checked out, as long as nothing local would be lost.
-    if a.problem and a.branch and remote_has_branch("origin", a.branch, cwd=dest):
-        code, dirty = git(["status", "--porcelain", "--untracked-files=no"], cwd=dest)
-        if code == 0 and not dirty:
-            out(f"{a.name}: switching to branch {a.branch}")
-            git(["fetch", "origin", f"+refs/heads/{a.branch}:refs/remotes/origin/{a.branch}"], cwd=dest)
-            code, text = git(["checkout", a.branch], cwd=dest)
-            if code != 0:
-                return False, text.splitlines()[-1] if text else "git checkout failed"
-    out(f"{a.name}: pulling")
-    code, text = git(["pull", "--ff-only"], cwd=dest)
+def remote_info(remote: str, wanted=None, cwd=None, timeout: float = 120):
+    """(info, None) about the remote's default branch and `wanted`, or (None, why not)."""
+    args = ["ls-remote", "--symref", remote, "HEAD"] + ([f"refs/heads/{wanted}"] if wanted else [])
+    code, text = git(args, cwd=cwd, timeout=timeout)
     if code != 0:
-        return False, text.splitlines()[-1] if text else "git pull failed"
-    return True, text.splitlines()[-1] if text else "up to date"
+        return None, last_line(text, "git ls-remote failed")
+    return parse_ls_remote(text), None
+
+
+def choose_branch(wanted, info: dict):
+    """The branch an app follows: its branch from atlases.json while that still
+    exists on GitHub, otherwise the repository's default branch."""
+    if wanted and wanted in info["heads"]:
+        return wanted
+    return info["default"]
+
+
+def required_files(a: Atlas) -> list:
+    """Files the app needs, which the branch a clone switches to must have."""
+    if a.kind == "node" and a.entry:
+        return [a.entry]
+    if a.kind in ("npm", "server") or (a.kind == "static" and a.wants_build and not isinstance(a.build, list)):
+        return ["package.json"]
+    if a.kind == "static" and not a.wants_build:
+        return [posixpath.normpath(posixpath.join(a.root or ".", "index.html"))]
+    if a.kind == "cmd" and isinstance(a.cmd, list):
+        return [str(p) for p in a.cmd[1:] if "{" not in str(p) and re.fullmatch(r"[\w./-]+\.(?:py|js|mjs|cjs)", str(p))]
+    return []
+
+
+class SyncResult:
+    """How a sync went for one app: downloaded, updated, uptodate, skipped, ignored or failed."""
+
+    def __init__(self, status: str, text: str, old=None, new=None, branch=None):
+        self.status, self.text, self.old, self.new, self.branch = status, text, old, new, branch
+
+    @property
+    def ok(self) -> bool:
+        return self.status in ("downloaded", "updated", "uptodate", "ignored")
+
+    @property
+    def changed(self) -> bool:
+        return self.status in ("downloaded", "updated")
+
+    def __repr__(self):
+        return f"SyncResult({self.status!r}, {self.text!r})"
+
+
+def short(sha) -> str:
+    return (sha or "nothing")[:7]
+
+
+def rev(dest: Path, ref: str):
+    code, text = git(["rev-parse", "-q", "--verify", ref + "^{commit}"], cwd=dest, timeout=60)
+    return text.strip() if code == 0 and text.strip() else None
+
+
+def is_ancestor(dest: Path, older: str, newer: str) -> bool:
+    return git(["merge-base", "--is-ancestor", older, newer], cwd=dest, timeout=60)[0] == 0
+
+
+def count_commits(dest: Path, spec: str) -> int:
+    code, text = git(["rev-list", "--count", spec], cwd=dest, timeout=60)
+    return int(text) if code == 0 and text.strip().isdigit() else 0
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def not_on_github(n: int, word: str = "local commit") -> str:
+    return f"{plural(n, word)} that {'is' if n == 1 else 'are'}n't on GitHub"
+
+
+def files_in_message(text: str) -> list:
+    """The files git lists (indented with a tab) in "would be overwritten" errors."""
+    return [ln.strip() for ln in text.splitlines() if ln.startswith("\t") and ln.strip()]
+
+
+def explain_blocked(text: str, dest: Path) -> str:
+    files = files_in_message(text)
+    shown = ", ".join(files[:3]) + (f" and {len(files) - 3} more" if len(files) > 3 else "")
+    if "untracked" in text and files:
+        return f"untracked files are in the way ({shown}): move them away, then update again"
+    if files:
+        return (f"uncommitted changes to {shown} are in the way: commit them, or discard them with "
+                f"`git -C \"{dest}\" checkout -- {files[0]}`, then update again")
+    return last_line(text, "git refused")
+
+
+def update_clone(dest: Path, wanted=None, required=(), out=lambda msg: None) -> SyncResult:
+    """Fetch the branch the clone follows, switch to it when the clone is clean, and
+    fast-forward. Changes nothing when local commits or changes are in the way."""
+    if not (dest / ".git").exists():
+        return SyncResult("ignored", "skipped: not a git clone")
+    info, err = remote_info("origin", wanted, cwd=dest)
+    if info is None:
+        return SyncResult("failed", f"failed: couldn't reach origin ({err})")
+    branch = choose_branch(wanted, info)
+    if not branch:
+        return SyncResult("failed", "failed: couldn't tell which branch origin starts on")
+    gone = f"; its branch '{wanted}' is gone from GitHub, so it follows '{branch}'" if wanted and branch != wanted else ""
+    out(f"fetching {branch}")
+    code, text = git(["fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], cwd=dest)
+    if code != 0:
+        return SyncResult("failed", f"failed: {last_line(text, 'git fetch failed')}", branch=branch)
+    target = rev(dest, f"refs/remotes/origin/{branch}")
+    old = rev(dest, "HEAD")
+    code, current = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=dest, timeout=60)
+    current = current.strip() if code == 0 else None
+
+    if current != branch:
+        where = f"'{current}'" if current else f"commit {short(old)}"
+        missing = [p for p in required if git(["cat-file", "-e", f"{target}:{p}"], cwd=dest, timeout=60)[0] != 0]
+        if missing:
+            return SyncResult("skipped", f"skipped: '{branch}' has no {missing[0]}, so the clone stays on {where}"
+                                         f" (set \"branch\" for it in atlases.json){gone}", old, old, branch)
+        code, dirty = git(["status", "--porcelain", "--untracked-files=no"], cwd=dest, timeout=60)
+        if code != 0 or dirty.strip():
+            files = [ln.strip().split(None, 1)[-1] for ln in dirty.splitlines() if ln.strip()]
+            hint = f": commit them, or discard them with `git -C \"{dest}\" checkout -- {files[0]}`" if files else ""
+            return SyncResult("skipped", f"skipped: it would switch from {where} to '{branch}', but uncommitted "
+                                         f"changes to {', '.join(files[:3]) or 'some files'} are in the way{hint}",
+                              old, old, branch)
+        if current is None and old:
+            code, holders = git(["branch", "-a", "--contains", old], cwd=dest, timeout=60)
+            if code == 0 and not holders.strip():
+                return SyncResult("skipped", f"skipped: commit {short(old)} is on no branch, and switching to "
+                                             f"'{branch}' would hide it", old, old, branch)
+        local = rev(dest, f"refs/heads/{branch}")
+        out(f"switching to {branch}")
+        if local:
+            if not is_ancestor(dest, local, target):
+                n = count_commits(dest, f"{target}..{local}")
+                return SyncResult("skipped", f"skipped: the local '{branch}' has {not_on_github(n, 'commit')}",
+                              old, old, branch)
+            code, text = git(["checkout", "-q", branch], cwd=dest)
+            if code == 0:
+                code, text = git(["merge", "--ff-only", "-q", target], cwd=dest)
+        else:
+            code, text = git(["checkout", "-q", "-b", branch, "--track", f"origin/{branch}"], cwd=dest)
+        if code != 0:
+            now = rev(dest, "HEAD")
+            return SyncResult("skipped", f"skipped: {explain_blocked(text, dest)}", old, now, branch)
+        new = rev(dest, "HEAD")
+        return SyncResult("updated", f"switched from {where} to '{branch}': {short(old)} -> {short(new)}{gone}",
+                          old, new, branch)
+
+    if old == target:
+        return SyncResult("uptodate", f"already up to date ({branch} {short(old)}){gone}", old, old, branch)
+    if old and not is_ancestor(dest, old, target):
+        ahead = count_commits(dest, f"{target}..{old}")
+        if is_ancestor(dest, target, old):
+            return SyncResult("uptodate", f"already up to date, with {not_on_github(ahead)} ({branch}){gone}",
+                              old, old, branch)
+        return SyncResult("skipped", f"skipped: the clone has {not_on_github(ahead)}, so it can't "
+                                     f"fast-forward to '{branch}'", old, old, branch)
+    out(f"fast-forwarding {branch}")
+    code, text = git(["merge", "--ff-only", "-q", target], cwd=dest)
+    if code != 0:
+        return SyncResult("skipped", f"skipped: {explain_blocked(text, dest)}", old, old, branch)
+    new = rev(dest, "HEAD")
+    return SyncResult("updated", f"updated {short(old)} -> {short(new)} ({branch}){gone}", old, new, branch)
+
+
+def git_sync(a: Atlas, db: Path, out=lambda msg: None) -> SyncResult:
+    """Clone a missing atlas into the db folder on the branch it follows, or update a clone."""
+    if not shutil.which("git"):
+        return SyncResult("failed", "failed: git is not installed")
+    if a.path is not None:
+        return update_clone(a.path, a.branch, required_files(a), out)
+    if not a.repo:
+        return SyncResult("failed", "failed: atlases.json gives no GitHub repository for it")
+    url = f"https://github.com/{a.repo}.git"
+    dest = db / a.name
+    if dest.exists():
+        return SyncResult("failed", f"failed: {dest} already exists but is not an atlas Oracle recognises")
+    info, err = remote_info(url, a.branch)
+    if info is None:
+        return SyncResult("failed", f"failed: couldn't reach {url} ({err})")
+    branch = choose_branch(a.branch, info)
+    db.mkdir(parents=True, exist_ok=True)
+    out(f"cloning {a.repo} ({branch or 'default branch'}) into {dest}")
+    code, text = git(["clone"] + (["--branch", branch] if branch else []) + [url, str(dest)])
+    if code != 0:
+        return SyncResult("failed", f"failed: {last_line(text, 'git clone failed')}")
+    new = rev(dest, "HEAD")
+    return SyncResult("downloaded", f"downloaded ({branch} {short(new)})", None, new, branch)
+
+
+def update_status(dest: Path, wanted=None) -> dict:
+    """Whether GitHub has something newer for a clone (asks the remote; changes nothing)."""
+    info, err = remote_info("origin", wanted, cwd=dest, timeout=30)
+    if info is None:
+        return {"available": False, "error": err}
+    branch = choose_branch(wanted, info)
+    remote = info["heads"].get(branch) if branch else None
+    local = rev(dest, "HEAD")
+    code, current = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=dest, timeout=30)
+    current = current.strip() if code == 0 else None
+    status = {"branch": branch, "local": short(local), "remote": short(remote), "switch": current != branch}
+    if not remote:
+        status["available"] = False
+    elif current != branch:
+        status["available"] = True
+    elif remote == local:
+        status["available"] = False
+    else:
+        known = git(["cat-file", "-e", f"{remote}^{{commit}}"], cwd=dest, timeout=30)[0] == 0
+        status["available"] = not (known and local and is_ancestor(dest, remote, local))
+    return status
 
 
 # --------------------------------------------------------------- supervisor
 
 class Supervisor:
     def __init__(self, db: Path, registry: dict, cfg: dict, host: str = "127.0.0.1",
-                 dashboard_port: int = DEFAULT_PORT, quiet: bool = False):
+                 dashboard_port: int = DEFAULT_PORT, quiet: bool = False, queue=None):
         self.db, self.registry, self.cfg = db, registry, cfg
         self.host, self.dashboard_port, self.quiet = host, dashboard_port, quiet
         self.lan = host not in LOCAL_HOSTS      # atlases and dashboard open to the network
+        self.queue = queue or BuildQueue()
         self.lock = threading.RLock()
         self.runners: dict = {}
+        self.checking = 0                       # update checks under way
         self.rescan()
 
     def report(self, r: Runner) -> None:
         if self.quiet:
             return
-        line = f"{r.atlas.name:<15} {r.state:<10}"
-        if r.state == "running":
+        state = "updating" if r.task == "updating" and r.state != "running" else r.state
+        line = f"{r.atlas.name:<15} {state:<10}"
+        if r.state == "running" and not r.task:
             line += f" {r.atlas.url}"
         elif r.message:
             line += f" {r.message}"
@@ -873,10 +1738,11 @@ class Supervisor:
             for name, a in atlases.items():
                 r = self.runners.get(name)
                 if r is None:
-                    self.runners[name] = Runner(a, self.host, self.report)
+                    self.runners[name] = Runner(a, self.host, self.report, self.queue)
                 elif not r.active:
                     r.atlas = a
-                    r.reset()
+                    if r.state != "failed" or a.problem:     # a failed build stays visible
+                        r.reset()
             gone = [n for n, r in self.runners.items() if n not in atlases and not r.active]
             for name in gone:
                 del self.runners[name]
@@ -898,28 +1764,32 @@ class Supervisor:
             fresh["skip"] = self.cfg["skip"] = sorted(skip)
             save_config(fresh)
 
-    def start(self, names=None) -> None:
+    def start(self, names=None, manual: bool = False) -> None:
         with self.lock:
             runners = list(self.runners.values())
         for r in runners:
             wanted = (r.atlas.name in names) if names is not None else self.is_selected(r.atlas.name)
             if wanted and r.atlas.path is not None:
-                r.start()
+                r.start(manual=manual)
 
     def stop_all(self) -> None:
         with self.lock:
-            runners = [r for r in self.runners.values() if r.proc is not None or r.state == "starting"]
+            runners = [r for r in self.runners.values() if r.proc is not None or r.state in PHASES]
         threads = [threading.Thread(target=r.stop, daemon=True) for r in runners]
         for t in threads:
             t.start()
         for t in threads:
             t.join(timeout=15)
 
-    def restart(self, name: str) -> None:
+    def restart(self, name: str, manual: bool = True) -> None:
+        """Stop the app, pick up changes to its folder (a new branch, a build script), start it."""
         r = self.runner(name)
-        if r and r.state != "syncing":
+        if r and r.state != "syncing" and not r.task:
             r.stop()
-            r.start()
+            self.rescan()
+            r = self.runner(name)
+            if r and r.atlas.path is not None:
+                r.start(manual=manual)
 
     def download(self, name: str) -> bool:
         r = self.runner(name)
@@ -934,29 +1804,125 @@ class Supervisor:
                 log.write((msg + "\n").encode())
                 log.flush()
             try:
-                ok, msg = git_sync(r.atlas, self.db, out)
-                out(msg)
+                res = git_sync(r.atlas, self.db, out)
+                out(res.text)
             finally:
                 log.close()
             with r.lock:
                 r.state = "stopped"           # idle again, so rescan() refreshes it
             self.rescan()
-            if not ok:
-                r.set("error", f"download failed: {msg}")
+            if not res.ok:
+                r.set("error", f"download {res.text}")
             elif self.is_selected(name) and r.atlas.path is not None and not r.atlas.problem:
                 r.start()
         threading.Thread(target=work, name=f"sync-{name}", daemon=True).start()
         return True
 
+    # ---- updates
+
+    @staticmethod
+    def needs_restart(a: Atlas) -> bool:
+        """A plain static site serves the new files at once; everything else restarts."""
+        return not (a.kind == "static" and not a.wants_build)
+
+    def update(self, name: str, wait: bool = False) -> bool:
+        """Sync one app from GitHub; if it was running and changed, restart it (which
+        rebuilds it when needed). False when the app is busy or not a clone."""
+        r = self.runner(name)
+        if r is None or r.atlas.path is None or not r.atlas.git or not r.begin_task("updating"):
+            return False
+        if wait:
+            self._update(r)
+        else:
+            threading.Thread(target=self._update, args=(r,), name=f"update-{name}", daemon=True).start()
+        return True
+
+    def _update(self, r: Runner) -> SyncResult:
+        name = r.atlas.name
+        log = open_log(r.log_path)
+
+        def out(msg):
+            log.write(f"[oracle] update: {msg}\n".encode())
+            log.flush()
+        res = SyncResult("failed", "failed: unexpected error")
+        try:
+            res = git_sync(r.atlas, self.db, out)
+            out(res.text)
+        except Exception as e:                     # never leave the card stuck on "updating"
+            res = SyncResult("failed", f"failed: {e}")
+        finally:
+            log.close()
+            r.note = res.text
+            was_running = r.state in ("running", "starting") and r.proc is not None
+            r.end_task()
+        if res.changed and was_running and self.needs_restart(r.atlas):
+            self.restart(name)
+        elif res.changed:
+            self.rescan()
+        self._check(r)
+        return res
+
+    def after_sync(self, name: str) -> None:
+        """`oracle.py sync` changed this app's folder: restart it if it runs, else refresh it."""
+        r = self.runner(name)
+        if r is None:
+            self.rescan()
+        elif r.state == "running" and r.proc is not None and self.needs_restart(r.atlas):
+            threading.Thread(target=self.restart, args=(name,), daemon=True).start()
+        else:
+            self.rescan()
+            self.check_updates([name])
+
+    def update_all(self) -> None:
+        with self.lock:
+            names = [n for n, r in self.runners.items() if r.atlas.path is not None and r.atlas.git]
+
+        def work():
+            for name in names:
+                r = self.runner(name)
+                if r is not None and r.atlas.git and r.begin_task("updating"):
+                    self._update(r)
+        threading.Thread(target=work, name="update-all", daemon=True).start()
+
+    def _check(self, r: Runner) -> None:
+        try:
+            r.update_info = update_status(r.atlas.path, r.atlas.branch)
+        except Exception as e:
+            r.update_info = {"available": False, "error": str(e)}
+        r.notify()
+
+    def check_updates(self, names=None, wait: bool = False) -> None:
+        """Ask GitHub whether the clones are behind (on Rescan and after an Update)."""
+        with self.lock:
+            runners = [r for n, r in self.runners.items()
+                       if r.atlas.path is not None and r.atlas.git and (names is None or n in names)]
+        slots = threading.Semaphore(6)
+
+        def one(r):
+            with slots:
+                self._check(r)
+            with self.lock:
+                self.checking -= 1
+        with self.lock:
+            self.checking += len(runners)
+        threads = [threading.Thread(target=one, args=(r,), daemon=True) for r in runners]
+        for t in threads:
+            t.start()
+        if wait:
+            for t in threads:
+                t.join(timeout=60)
+
     def status(self) -> dict:
         with self.lock:
             runners = list(self.runners.values())
+            checking = self.checking > 0
         return {
             "app": "oracle", "version": VERSION, "pid": os.getpid(),
             "db": str(self.db), "db_exists": self.db.is_dir(),
             "lan": self.lan, "lan_ip": best_lan_ip() if self.lan else None,
             "lan_ips": [{"ip": ip, "adapter": name, "kind": kind} for name, ip, kind in local_addresses()]
             if self.lan else [],
+            "checking": checking,
             "atlases": [r.info(self.is_selected(r.atlas.name)) for r in runners],
         }
 
@@ -1000,17 +1966,37 @@ class StaticHandler(PlainHTTP, SimpleHTTPRequestHandler):
         ".wasm": "application/wasm", ".webmanifest": "application/manifest+json",
     }
 
+    spa = False          # built single-page apps: unknown routes get index.html
+
     def end_headers(self):
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
+
+    def send_head(self):
+        if self.spa and spa_fallback(self.path, self.translate_path(self.path)):
+            self.path = "/index.html"
+        return super().send_head()
 
     def log_request(self, code="-", size="-"):
         if str(code)[:1] in ("4", "5"):
             super().log_request(code, size)
 
 
-def serve_static(root: str, port: int, host: str) -> None:
-    handler = functools.partial(StaticHandler, directory=root)
+def spa_fallback(url_path: str, file_path: str) -> bool:
+    """True for a path that isn't a file and has no extension (/notes/42): a client-side
+    route, which a reload must answer with index.html. /missing.js stays a 404."""
+    if os.path.exists(file_path):
+        return False
+    last = posixpath.basename(unquote(urlparse(url_path).path).rstrip("/"))
+    return "." not in last
+
+
+class SpaHandler(StaticHandler):
+    spa = True
+
+
+def serve_static(root: str, port: int, host: str, spa: bool = False) -> None:
+    handler = functools.partial(SpaHandler if spa else StaticHandler, directory=root)
     with Server((host, port), handler) as httpd:
         print(f"Serving {root} at http://localhost:{port}", flush=True)
         try:
@@ -1174,6 +2160,9 @@ class DashboardHandler(PlainHTTP, BaseHTTPRequestHandler):
             threading.Thread(target=sup.stop_all, daemon=True).start()
         elif parts == ["api", "rescan"]:
             sup.rescan()
+            sup.check_updates()              # asks GitHub in the background
+        elif parts == ["api", "update-all"]:
+            sup.update_all()
         elif parts == ["api", "shutdown"]:
             if self.scope != "local":
                 return self._json({"error": "Oracle can only be quit on the computer it runs on."}, 403)
@@ -1185,8 +2174,8 @@ class DashboardHandler(PlainHTTP, BaseHTTPRequestHandler):
             r = sup.runner(name)
             if r is None:
                 return self._json({"error": "no such atlas"}, 404)
-            if action == "start":
-                r.start()
+            if action == "start":            # a start by hand: may install and build
+                r.start(manual=True)
             elif action == "stop":
                 threading.Thread(target=r.stop, daemon=True).start()
             elif action == "restart":
@@ -1196,6 +2185,13 @@ class DashboardHandler(PlainHTTP, BaseHTTPRequestHandler):
             elif action == "download":
                 if not sup.download(name):
                     return self._json({"error": "it is busy"}, 409)
+            elif action == "update":
+                if not r.atlas.git:
+                    return self._json({"error": "it isn't a git clone, so there is nothing to update"}, 409)
+                if not sup.update(name):
+                    return self._json({"error": "it is busy: try again when it has finished"}, 409)
+            elif action == "synced":           # `oracle.py sync` changed it
+                sup.after_sync(name)
             else:
                 return self._json({"error": "unknown action"}, 404)
         else:
@@ -1722,7 +2718,7 @@ def cmd_start(args) -> int:
         unknown = [n for n in names if sup.runner(n) is None or sup.runner(n).atlas.path is None]
         for n in unknown:
             say(f"{n}: not in the folder, skipped")
-    sup.start(names)
+    sup.start(names, manual=bool(args.only))      # --only is a start by hand
     say(f"Dashboard: {url}   (Ctrl+C stops Oracle and every atlas it started)")
     if lan:
         where = best_lan_ip() or "this-computer"
@@ -1805,21 +2801,30 @@ def cmd_select(args, selected: bool) -> int:
 def cmd_sync(args) -> int:
     cfg = load_config()
     db = resolve_db(args.db, cfg)
-    atlases = scan(db, load_registry(), cfg.get("port") or DEFAULT_PORT)
+    port = cfg.get("port") or DEFAULT_PORT
+    atlases = scan(db, load_registry(), port)
     names = args.names or [n for n, a in atlases.items()
-                           if a.repo and (not args.selected or n not in cfg["skip"])]
-    failed = 0
+                           if (a.path is not None or a.repo) and (not args.selected or n not in cfg["skip"])]
+    width = max([len(n) for n in names] + [15])
+    failed, changed = 0, []
     for name in names:
         a = atlases.get(name)
         if a is None:
-            say(f"{name}: no such atlas")
+            print(f"  {name:<{width}} no such atlas", flush=True)
             failed += 1
             continue
-        ok, msg = git_sync(a, db)
-        say(f"{name}: {msg}")
-        failed += not ok
+        res = git_sync(a, db)
+        print(f"  {name:<{width}} {res.text}", flush=True)
+        failed += not res.ok
+        if res.changed and a.path is not None:
+            changed.append(name)
     if failed:
-        say(f"{failed} could not be synced.")
+        say(f"{plural(failed, 'app')} could not be synced.")
+    if changed and call_oracle(port, "/api/status"):
+        say("Oracle is running: it restarts the updated apps that were running ("
+            + ", ".join(changed) + "), rebuilding them if needed.")
+        for name in changed:
+            call_oracle(port, f"/api/atlas/{quote(name)}/synced", post=True)
     return 1 if failed else 0
 
 
@@ -1977,7 +2982,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--all", action="store_true", help="every atlas")
 
     s = with_db(sub.add_parser("sync", help="clone missing atlases from GitHub and update the others"))
-    s.add_argument("names", nargs="*", metavar="NAME", help="default: all atlases in atlases.json")
+    s.add_argument("names", nargs="*", metavar="NAME",
+                   help="default: every app in the folder, and the ones in atlases.json that are missing")
     s.add_argument("--selected", action="store_true", help="only the selected ones")
 
     s = sub.add_parser("stop", help="stop a running Oracle and its atlases")
@@ -2008,6 +3014,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("root")
     s.add_argument("--port", type=int, required=True)
     s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--spa", action="store_true", help="answer unknown routes with index.html")
     return p
 
 
@@ -2026,7 +3033,7 @@ def main(argv=None) -> int:
         argv = ["start"] + list(argv)
     args = build_parser().parse_args(argv)
     if args.command == "serve-static":
-        serve_static(args.root, args.port, args.host)
+        serve_static(args.root, args.port, args.host, spa=args.spa)
         return 0
     handlers = {
         "start": cmd_start, "list": cmd_list, "sync": cmd_sync, "stop": cmd_stop,
