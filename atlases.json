@@ -148,10 +148,11 @@
     },
     {
       "name": "orchestrator",
-      "title": "Storyline",
+      "title": "Orchestrator",
       "group": "Writing tools",
-      "about": "A timeline plotter for stories. Projects are saved as .storyline files in the app's projects folder.",
+      "about": "Storyline, a timeline plotter for stories. Projects are saved as .storyline files in the app's projects folder.",
       "kind": "cmd",
+      "entry": "app.py",
       "cmd": ["{python}", "-B", "-c", "import app; app.run('{host}', {port})"],
       "port": 5000,
       "branch": "codex/build-python-web-app-for-timeline-plotter"
@@ -162,6 +163,7 @@
       "group": "Writing tools",
       "about": "A story relationship diagram: characters on intimacy circles, a golden-ratio spiral and Fibonacci arms, exported as PNG.",
       "kind": "cmd",
+      "entry": "app.py",
       "cmd": ["{python}", "app.py", "--host", "{host}", "--port", "{port}"],
       "port": 8003,
       "branch": "codex/create-interactive-spiral-diagram-in-python"

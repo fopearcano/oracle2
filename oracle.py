@@ -634,6 +634,14 @@ class Atlas:
         return bool(self.build) and self.build is not False
 
 
+def missing_on_branch(a: Atlas, what: str) -> str:
+    msg = f"{what} is missing"
+    if a.branch:
+        msg += (f": this app lives on the '{a.branch}' branch."
+                f" Press Update, or run `python3 oracle.py sync {a.name}`, to switch to it")
+    return msg
+
+
 def find_problem(a: Atlas):
     if a.path is None:
         return "not in the folder"
@@ -648,21 +656,15 @@ def find_problem(a: Atlas):
             return f"no index.html in {a.path / (a.root or '.')}"
     elif a.kind == "node":
         if not a.entry or not (a.path / a.entry).is_file():
-            msg = f"{a.entry or 'the server script'} is missing"
-            if a.branch:
-                msg += (f": this app lives on the '{a.branch}' branch."
-                        f" Press Update, or run `python3 oracle.py sync {a.name}`, to switch to it")
-            return msg
+            return missing_on_branch(a, a.entry or "the server script")
     elif a.kind in ("npm", "server"):
         if not (a.path / "package.json").is_file():
-            msg = "package.json is missing"
-            if a.branch:
-                msg += (f": this app lives on the '{a.branch}' branch."
-                        f" Press Update, or run `python3 oracle.py sync {a.name}`, to switch to it")
-            return msg
+            return missing_on_branch(a, "package.json")
     elif a.kind == "cmd":
         if not isinstance(a.cmd, list) or not a.cmd:
             return "\"cmd\" must be a list such as [\"python3\", \"serve.py\", \"{port}\"]"
+        if a.entry and not (a.path / a.entry).is_file():      # the file the command needs
+            return missing_on_branch(a, a.entry)
     else:
         return "Oracle doesn't know how to start it (no \"kind\" in atlases.json)"
     if a.build is not None and not isinstance(a.build, (bool, str, list)):
@@ -1520,7 +1522,9 @@ def required_files(a: Atlas) -> list:
     if a.kind == "static" and not a.wants_build:
         return [posixpath.normpath(posixpath.join(a.root or ".", "index.html"))]
     if a.kind == "cmd" and isinstance(a.cmd, list):
-        return [str(p) for p in a.cmd[1:] if "{" not in str(p) and re.fullmatch(r"[\w./-]+\.(?:py|js|mjs|cjs)", str(p))]
+        files = [a.entry] if a.entry else []
+        files += [str(p) for p in a.cmd[1:] if "{" not in str(p) and re.fullmatch(r"[\w./-]+\.(?:py|js|mjs|cjs)", str(p))]
+        return list(dict.fromkeys(files))
     return []
 
 

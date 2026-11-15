@@ -6,7 +6,7 @@ Oracle starts all your web atlases with one command. Put the atlases in one fold
 
 It is a single Python file (`oracle.py`) that uses only the standard library. You need:
 
-- **Python 3.8+** for Oracle itself, for the static atlases and for Storyline and Spiral;
+- **Python 3.8+** for Oracle itself, for the static atlases and for Orchestrator and Spiral;
 - **Node.js** for the apps that run their own server or need a build: **20.19 or newer** covers them all, except PERSONA 2, which needs **22.12 or newer** (the current Node.js LTS is fine for everything);
 - **git** for downloading and updating the atlases.
 
@@ -46,7 +46,7 @@ On macOS you can double-click `start-oracle.command`. On Windows, double-click `
 
 ## The atlases
 
-Oracle knows these from [`atlases.json`](atlases.json). Each one keeps the port it already used, so your bookmarks keep working. This matters even more for the apps that keep your data in the browser (Outliner, Draftist, Spiral, Storyline, Universe Map, Astrum): the browser files that data under the address, port included, so the same port means the same data.
+Oracle knows these from [`atlases.json`](atlases.json). Each one keeps the port it already used, so your bookmarks keep working. This matters even more for the apps that keep your data in the browser (Outliner, Draftist, Spiral, Orchestrator, Universe Map, Astrum): the browser files that data under the address, port included, so the same port means the same data.
 
 | Atlas | Port | How it runs |
 |---|---|---|
@@ -66,7 +66,7 @@ Oracle knows these from [`atlases.json`](atlases.json). Each one keeps the port 
 | dialoguedevil: Dialogue Devil | 4134 | `node server.js`, after `npm ci` |
 | outliner: Outliner | 5273 | Vite: built, then `dist/` served as a static site |
 | draftist: Draftist | 5146 | built (`npm run build`), then `dist/` served as a static site |
-| orchestrator: Storyline | 5000 | its Python server (`app.py`), given Oracle's port and host |
+| orchestrator: Orchestrator | 5000 | its Python server (`app.py`, whose page calls itself Storyline), given Oracle's port and host |
 | vdc-spiral: Spiral | 8003 | `python app.py --host … --port …` |
 | persona2: PERSONA 2 | 4317 | built, then `npm start` (one server for the API and the interface) |
 | storyboarder: Sequence | 8009 | built (`npm run build`), then its own server, `node server/index.js` |
@@ -77,7 +77,7 @@ Oracle serves the static sites itself and tells the browser to re-check every fi
 
 **Sequence runs on 8009, not 8003.** Its README says 8003, which Spiral already uses, and Spiral keeps its projects in the browser under that port, so Spiral keeps it. Sequence saves its projects on this computer, so moving it loses nothing; only its layout and theme settings in the browser start fresh.
 
-**Port 5000 on a Mac.** macOS uses port 5000 for AirPlay Receiver, so there Storyline would show as *Already running*. Turn off AirPlay Receiver in System Settings, or give Storyline another port in `atlases.json`. Windows and Linux don't have this problem.
+**Port 5000 on a Mac.** macOS uses port 5000 for AirPlay Receiver, so there Orchestrator would show as *Already running*. Turn off AirPlay Receiver in System Settings, or give Orchestrator another port in `atlases.json`. Windows and Linux don't have this problem.
 
 ### Adding another atlas
 
@@ -107,6 +107,7 @@ Every app gets `PORT` and `HOST` in its environment. `cmd` and `env` can use `{p
 | `kind` | `static` (Oracle serves a folder), `node` (`node <entry>`), `npm` (`npm start`), `server` (a framework's production server, see below) or `cmd` (your own command) |
 | `build` | `true` runs the `build` script of package.json, a name such as `"build:web"` runs that script, a list such as `["{python}", "make_site.py"]` runs that command, and `false` never builds. Without it, Oracle builds whenever package.json has a `build` script |
 | `root` | for `static`: the folder to serve, such as `"dist"` |
+| `entry` | for `node`: the script to run. For `cmd`: the file the command needs, such as `"app.py"`, so Oracle can tell when a clone is on a branch without the app |
 | `framework` | for `server`: `next`, `nuxt`, `sveltekit`, `astro`, `remix` or `react-router` (normally detected) |
 | `output` | for `npm`, `node` and `cmd` apps with a build: a file or folder the build makes, so Oracle rebuilds when it is missing |
 | `env` | extra environment variables, for apps that read their own names instead of `PORT` and `HOST` |
@@ -157,7 +158,7 @@ Apps written with Vite, React, Next.js and similar tools must be installed and b
 
 The card shows each step: **Installing**, **Building**, **Starting**, **Running**, with how long the step has taken so far. There is no time limit. Oracle installs and builds one app at a time, so starting everything at login doesn't overload the computer; the others show **Waiting to build**. The install and build output goes to the app's log. If a build fails, the card says *Build failed: open the log* and offers **Retry**.
 
-Apps that ignore `PORT`, or read their own variable names, still run: a `cmd` entry passes them the port (Storyline, Spiral), or an `env` entry sets their variables (PERSONA 2). Apps made of several processes started together with `concurrently` are usually like that only in development: PERSONA 2, for example, serves its API and its interface from one process after a build, and that is what Oracle runs. If an app really needs two servers, a `cmd` entry can start both (for example `["npm", "run", "start:all"]`), but Oracle only watches the port it gave the app.
+Apps that ignore `PORT`, or read their own variable names, still run: a `cmd` entry passes them the port (Orchestrator, Spiral), or an `env` entry sets their variables (PERSONA 2). Apps made of several processes started together with `concurrently` are usually like that only in development: PERSONA 2, for example, serves its API and its interface from one process after a build, and that is what Oracle runs. If an app really needs two servers, a `cmd` entry can start both (for example `["npm", "run", "start:all"]`), but Oracle only watches the port it gave the app.
 
 ### Safety
 
@@ -277,7 +278,7 @@ Settings are saved in `oracle.config.json` next to `oracle.py`, and build record
 - **Network access.** Everything listens on this computer only until you turn LAN mode on (see [Using it from a phone or another computer](#using-it-from-a-phone-or-another-computer)).
 - **"Already running".** If something already answers on an atlas's port (for example, you started it by hand), Oracle leaves it alone and shows it as *Already running*.
 - **Logs.** Each atlas writes its output to `logs/<name>.log`, together with its installs, builds and updates. The dashboard's **Log** button shows the latest part. When an atlas crashes or can't start, the card tells you why.
-- **Data kept in the app folder.** Some apps save your work inside their own folder: Story Builder and CharBuild in `data/`, Dialogue Devil in `data/projects/`, Sequence in `data/` (projects, images and PDFs) and Storyline in `projects/`. Updates leave these files alone. Back them up, and don't delete or re-clone an app's folder without copying them first.
+- **Data kept in the app folder.** Some apps save your work inside their own folder: Story Builder and CharBuild in `data/`, Dialogue Devil in `data/projects/`, Sequence in `data/` (projects, images and PDFs) and Orchestrator in `projects/`. Updates leave these files alone. Back them up, and don't delete or re-clone an app's folder without copying them first.
 - **AI features.** story, char-build and dialoguedevil still take their API key the usual way: in their own Settings, from char-build's `.env`, or from variables such as `ANTHROPIC_API_KEY`. Oracle passes its environment through, so a key that is set when Oracle starts reaches them.
 
 ## Tests

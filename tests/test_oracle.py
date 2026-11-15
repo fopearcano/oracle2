@@ -128,6 +128,18 @@ class ScanTest(TempDirCase):
         atlases = oracle.scan(self.db, self.REGISTRY)
         self.assertEqual(atlases["lit-atlas"].path.name, "LitAtlas-copy")
 
+    def test_custom_command_app_on_another_branch_is_explained(self):
+        registry = {"orchestrator": {"name": "orchestrator", "kind": "cmd", "entry": "app.py", "port": 5000,
+                                     "cmd": ["{python}", "-c", "import app; app.run('{host}', {port})"],
+                                     "branch": "codex/app"}}
+        write(self.db / "orchestrator" / ".gitkeep", "")                  # main holds nothing else
+        a = oracle.scan(self.db, registry)["orchestrator"]
+        self.assertIn("app.py is missing", a.problem)
+        self.assertIn("'codex/app' branch", a.problem)
+        self.assertEqual(oracle.required_files(a), ["app.py"])           # what sync checks before switching
+        write(self.db / "orchestrator" / "app.py", "")
+        self.assertIsNone(oracle.scan(self.db, registry)["orchestrator"].problem)
+
     def test_app_on_another_branch_is_explained(self):
         write(self.db / "story" / "docs" / "book.epub", "")
         problem = oracle.scan(self.db, self.REGISTRY)["story"].problem
