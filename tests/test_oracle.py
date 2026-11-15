@@ -536,6 +536,16 @@ class FirewallTest(TempDirCase):
         self.assertIsNone(rep.fix)
         self.assertEqual(rep.todo, [])
 
+    def test_windows_rule_made_before_new_apps_names_their_ports(self):
+        text = "PROFILE|Wi-Fi|Private\nFW|Private|True\nORACLE|True|Private, Domain|8800,8010\n"
+        rep = oracle.Report()
+        with mock.patch.object(oracle, "firewall_programs", return_value=[("Python", "C:\\py\\python.exe")]):
+            oracle.check_windows_firewall(rep, [8800, 8010, 5120, 8009], text=text)
+        self.assertIn(("!!", "", "the 'Oracle atlases' rule lacks ports 5120, 8009, used by apps added "
+                                 "since it was made"), rep.rows)
+        self.assertIn("ports 5120, 8009", rep.todo[0][0])
+        self.assertIn("8800, 8010, 5120, 8009", rep.fix_plan[0])         # --fix lets every port in
+
     def test_windows_firewall_off(self):
         rep = oracle.Report()
         oracle.check_windows_firewall(rep, [8800], text="PROFILE|Wi-Fi|Private\nFW|Private|False\n")
@@ -762,6 +772,46 @@ class RegistryFileTest(unittest.TestCase):
             self.assertIn(a.get("kind"), ("static", "node", "npm", "server", "cmd"), a["name"])
             self.assertTrue(a.get("title") and a.get("group") and a.get("about"), a["name"])
             self.assertTrue(isinstance(a["port"], int) and 1024 < a["port"] < 65536, a["name"])
+
+
+class FirewallWarningTest(TempDirCase):
+    """Windows, LAN mode: the dashboard says when the firewall keeps other devices out."""
+
+    def supervisor(self, lan=True):
+        write(self.db / "site" / "index.html", "")
+        registry = {"site": {"name": "site", "kind": "static", "port": 5120}}
+        return oracle.Supervisor(self.db, registry, oracle.load_config(), host="0.0.0.0" if lan else "127.0.0.1",
+                                 dashboard_port=8800, quiet=True)
+
+    def test_a_blocking_firewall_is_reported_with_the_fix(self):
+        sup = self.supervisor()
+        seen = []
+
+        def check(rep, ports, text=None, adapter=None):
+            seen.append(ports)
+            rep.todo.append(("Windows Firewall blocks the apps added since the firewall rule was made (port 5120).",
+                             "python3 oracle.py doctor --fix"))
+        with mock.patch.object(oracle, "IS_WIN", True), \
+                mock.patch.object(oracle, "check_windows_firewall", side_effect=check), \
+                mock.patch.object(oracle, "local_addresses", return_value=[]):
+            sup._check_firewall()
+        self.assertEqual(seen, [[5120, 8800]])                            # every app port and the dashboard
+        note = sup.status()["firewall"]
+        self.assertIn("port 5120", note)
+        self.assertIn("python3 oracle.py doctor --fix", note)
+        with mock.patch.object(oracle, "check_windows_firewall"), \
+                mock.patch.object(oracle, "local_addresses", return_value=[]):
+            sup._check_firewall()                                          # fixed: the note goes away
+        self.assertIsNone(sup.status()["firewall"])
+
+    def test_only_on_windows_in_lan_mode(self):
+        with mock.patch.object(oracle.threading, "Thread") as thread:
+            self.supervisor().check_firewall()                             # not Windows
+            with mock.patch.object(oracle, "IS_WIN", True), mock.patch.object(oracle, "is_wsl", return_value=False):
+                self.supervisor(lan=False).check_firewall()                # LAN mode off
+                self.assertEqual(thread.call_count, 0)
+                self.supervisor().check_firewall()
+                self.assertEqual(thread.call_count, 1)
 
 
 class WindowsAutostartTest(TempDirCase):

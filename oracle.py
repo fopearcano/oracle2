@@ -1719,6 +1719,7 @@ class Supervisor:
         self.lock = threading.RLock()
         self.runners: dict = {}
         self.checking = 0                       # update checks under way
+        self.firewall_note = None               # Windows, LAN mode: what blocks other devices
         self.rescan()
 
     def report(self, r: Runner) -> None:
@@ -1912,6 +1913,31 @@ class Supervisor:
             for t in threads:
                 t.join(timeout=60)
 
+    def check_firewall(self) -> None:
+        """Windows, LAN mode: find out in the background whether the firewall lets other
+        devices in (after a start, and on Rescan), so the dashboard can say how to fix it."""
+        if IS_WIN and self.lan and not is_wsl():
+            threading.Thread(target=self._check_firewall, name="firewall", daemon=True).start()
+
+    def _check_firewall(self) -> None:
+        with self.lock:
+            ports = sorted({self.dashboard_port} | {r.atlas.port for r in self.runners.values() if r.atlas.port})
+        addrs = local_addresses()
+        rep = Report()
+        try:
+            check_windows_firewall(rep, ports, adapter=addrs[0][0] if addrs else None)
+        except Exception:                       # a check that can't run says nothing
+            return
+        note = None
+        if rep.todo:
+            note = (" ".join(problem for problem, _ in rep.todo)
+                    + " Other devices can't open the apps until you run, on this computer: "
+                      "python3 oracle.py doctor --fix")
+        if note != self.firewall_note:
+            self.firewall_note = note
+            if note and not self.quiet:
+                say(note)
+
     def status(self) -> dict:
         with self.lock:
             runners = list(self.runners.values())
@@ -1922,7 +1948,7 @@ class Supervisor:
             "lan": self.lan, "lan_ip": best_lan_ip() if self.lan else None,
             "lan_ips": [{"ip": ip, "adapter": name, "kind": kind} for name, ip, kind in local_addresses()]
             if self.lan else [],
-            "checking": checking,
+            "checking": checking, "firewall": self.firewall_note if self.lan else None,
             "atlases": [r.info(self.is_selected(r.atlas.name)) for r in runners],
         }
 
@@ -2161,6 +2187,7 @@ class DashboardHandler(PlainHTTP, BaseHTTPRequestHandler):
         elif parts == ["api", "rescan"]:
             sup.rescan()
             sup.check_updates()              # asks GitHub in the background
+            sup.check_firewall()
         elif parts == ["api", "update-all"]:
             sup.update_all()
         elif parts == ["api", "shutdown"]:
@@ -2471,16 +2498,24 @@ def check_windows_firewall(rep: Report, ports: list, text=None, adapter=None) ->
     rule = info["rule"]
     rule_ok = bool(rule and rule[0] and covers(rule[1], target) and set(ports) <= rule[2])
     apps_ok = all(p in allowed for p in ours)
+    # The rule lists ports, so apps added after the last `doctor --fix` are left out.
+    stale = sorted(set(ports) - rule[2]) if rule and rule[0] and covers(rule[1], target) else []
     if rule_ok:
         rep.row("ok", "", f"the '{WIN_RULE}' rule lets the ports in")
     elif apps_ok:
         rep.row("ok", "", "Python and Node.js are allowed")
+    elif stale:
+        rep.row("!!", "", f"the '{WIN_RULE}' rule lacks port{'s' if len(stale) > 1 else ''} "
+                          f"{', '.join(map(str, stale))}, used by apps added since it was made")
     else:
         rep.row("!!", "", "nothing lets Oracle's ports in on this network yet")
     if blocked or not (rule_ok or apps_ok) or rep.public:
         if blocked or not (rule_ok or apps_ok):
-            rep.todo.append(("Windows Firewall blocks Oracle.",
-                             "python3 oracle.py doctor --fix   (Windows asks for permission)"))
+            problem = "Windows Firewall blocks Oracle."
+            if stale and not blocked:
+                problem = (f"Windows Firewall blocks the apps added since the firewall rule was made "
+                           f"(port{'s' if len(stale) > 1 else ''} {', '.join(map(str, stale))}).")
+            rep.todo.append((problem, "python3 oracle.py doctor --fix   (Windows asks for permission)"))
         rep.fix_plan = [f"add the firewall rule '{WIN_RULE}' for TCP ports {', '.join(map(str, ports))} "
                         "(Private and Domain networks only)"]
         if blocked:
@@ -2724,6 +2759,7 @@ def cmd_start(args) -> int:
         for n in unknown:
             say(f"{n}: not in the folder, skipped")
     sup.start(names, manual=bool(args.only))      # --only is a start by hand
+    sup.check_firewall()
     say(f"Dashboard: {url}   (Ctrl+C stops Oracle and every atlas it started)")
     if lan:
         where = best_lan_ip() or "this-computer"
