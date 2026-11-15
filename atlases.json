@@ -179,6 +179,17 @@
         "PERSONA_PORT": "{port}",
         "PERSONA_HOST": "{host}"
       }
+    },
+    {
+      "name": "storyboarder",
+      "title": "Sequence",
+      "group": "Writing tools",
+      "about": "A drawing-first storyboard studio for films and graphic novels: shot lists, a drawing studio, comic page layouts and PDF export.",
+      "kind": "node",
+      "entry": "server/index.js",
+      "build": true,
+      "output": "dist",
+      "port": 8009
     }
   ]
 }

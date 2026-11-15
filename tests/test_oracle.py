@@ -747,6 +747,23 @@ class AutostartTest(unittest.TestCase):
             self.assertIn(str(ROOT / "oracle.py"), text)
 
 
+class RegistryFileTest(unittest.TestCase):
+    """The real atlases.json: every app has a name, a way to start and a port of its own."""
+
+    def test_names_and_ports_are_unique(self):
+        data = json.loads((ROOT / "atlases.json").read_text(encoding="utf-8"))
+        names = [a["name"] for a in data["atlases"]]
+        ports = [a["port"] for a in data["atlases"]]
+        self.assertEqual(len(names), len(set(names)), "two apps share a name")
+        clashes = sorted({p for p in ports if ports.count(p) > 1})
+        self.assertEqual(clashes, [], "two apps share a port")
+        self.assertNotIn(oracle.DEFAULT_PORT, ports)                   # the dashboard's
+        for a in data["atlases"]:
+            self.assertIn(a.get("kind"), ("static", "node", "npm", "server", "cmd"), a["name"])
+            self.assertTrue(a.get("title") and a.get("group") and a.get("about"), a["name"])
+            self.assertTrue(isinstance(a["port"], int) and 1024 < a["port"] < 65536, a["name"])
+
+
 class HiddenStarterTest(TempDirCase):
     """start-oracle-hidden.vbs runs only on Windows, so this checks what it relies on:
     the port in oracle.config.json and the dashboard's answer, matched with its own patterns."""

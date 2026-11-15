@@ -69,10 +69,13 @@ Oracle knows these from [`atlases.json`](atlases.json). Each one keeps the port 
 | orchestrator: Storyline | 5000 | its Python server (`app.py`), given Oracle's port and host |
 | vdc-spiral: Spiral | 8003 | `python app.py --host … --port …` |
 | persona2: PERSONA 2 | 4317 | built, then `npm start` (one server for the API and the interface) |
+| storyboarder: Sequence | 8009 | built (`npm run build`), then its own server, `node server/index.js` |
 
 Oracle serves the static sites itself and tells the browser to re-check every file, so after an update you never get stale scripts.
 
 **Apps that live on a side branch.** story, char-build and dialoguedevil keep their app on a side branch, and their `main` holds only the book. draftist, orchestrator and vdc-spiral have only an empty `main`, with the app on a `codex/…` branch. `atlases.json` names those branches, and Oracle follows them while they exist on GitHub (see [Updates](#updates)).
+
+**Sequence runs on 8009, not 8003.** Its README says 8003, which Spiral already uses, and Spiral keeps its projects in the browser under that port, so Spiral keeps it. Sequence saves its projects on this computer, so moving it loses nothing; only its layout and theme settings in the browser start fresh.
 
 **Port 5000 on a Mac.** macOS uses port 5000 for AirPlay Receiver, so there Storyline would show as *Already running*. Turn off AirPlay Receiver in System Settings, or give Storyline another port in `atlases.json`. Windows and Linux don't have this problem.
 
@@ -271,7 +274,7 @@ Settings are saved in `oracle.config.json` next to `oracle.py`, and build record
 - **Network access.** Everything listens on this computer only until you turn LAN mode on (see [Using it from a phone or another computer](#using-it-from-a-phone-or-another-computer)).
 - **"Already running".** If something already answers on an atlas's port (for example, you started it by hand), Oracle leaves it alone and shows it as *Already running*.
 - **Logs.** Each atlas writes its output to `logs/<name>.log`, together with its installs, builds and updates. The dashboard's **Log** button shows the latest part. When an atlas crashes or can't start, the card tells you why.
-- **Data kept in the app folder.** Storyline saves projects in a `projects/` folder inside its clone. Updates leave such files alone. Don't delete the clone without copying them first.
+- **Data kept in the app folder.** Some apps save your work inside their own folder: Story Builder and CharBuild in `data/`, Dialogue Devil in `data/projects/`, Sequence in `data/` (projects, images and PDFs) and Storyline in `projects/`. Updates leave these files alone. Back them up, and don't delete or re-clone an app's folder without copying them first.
 - **AI features.** story, char-build and dialoguedevil still take their API key the usual way: in their own Settings, from char-build's `.env`, or from variables such as `ANTHROPIC_API_KEY`. Oracle passes its environment through, so a key that is set when Oracle starts reaches them.
 
 ## Tests
