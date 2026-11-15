@@ -195,7 +195,7 @@ This registers Oracle to run in the background at login, without opening a brows
 | System | What gets installed |
 |---|---|
 | macOS | `~/Library/LaunchAgents/local.oracle.atlases.plist` (a LaunchAgent) |
-| Windows | `Oracle atlases.vbs` in your Startup folder (runs with no console window) |
+| Windows | `Oracle atlases.vbs` in your Startup folder, which runs `start-oracle-hidden.vbs` (no console window) |
 | Linux | `~/.config/autostart/oracle-atlases.desktop` |
 
 The autostarted Oracle uses the folder set with `config --db`, so set that first. On macOS, keep `oracle.py` and the atlas folder outside Desktop, Documents and Downloads: macOS can block programs started at login from reading those folders.
@@ -208,9 +208,11 @@ python3 oracle.py stop
 
 ### Starting Oracle in the background on Windows
 
-Double-click `start-oracle-hidden.vbs`. It starts Oracle with no window and opens the dashboard, or just opens the dashboard if Oracle is already running. It needs Python's `pyw` launcher (it comes with the installer from python.org) or `pythonw`. For an icon on the desktop, right-click the file and choose *Send to > Desktop (create shortcut)*; add ` --no-browser` at the end of the shortcut's *Target* to start Oracle without opening the browser.
+Double-click `start-oracle-hidden.vbs`. It starts Oracle with no window and opens the dashboard, or just opens the dashboard if Oracle is already running. It needs Python's `pyw` launcher (it comes with the installer from python.org) or `pythonw`. `autostart on` uses the same file at login, without opening the browser.
 
-Oracle writes its messages to `logs\oracle.log`. If the dashboard doesn't answer within 30 seconds, for example because something else uses port 8800, the script shows the end of that log.
+**Keep it in the oracle2 folder.** It starts the `oracle.py` next to it, so a copy somewhere else can't work, and it says so. To start Oracle when you log in, use `python3 oracle.py autostart on` rather than putting the file in the Startup folder yourself. For an icon on the desktop, right-click the file and choose *Send to > Desktop (create shortcut)*: a shortcut works, and adding ` --no-browser` at the end of its *Target* starts Oracle without opening the browser.
+
+Oracle's messages, and any error from Python itself, go to `logs\oracle.log`. When Oracle doesn't start, the script shows what it wrote there. It gives up after a minute if Python writes nothing, or nothing from Oracle, and after three minutes if the dashboard still doesn't answer, for example because another program uses port 8800.
 
 ## Using it from a phone or another computer
 

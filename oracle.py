@@ -2261,6 +2261,11 @@ def autostart_content() -> str:
 </plist>
 """
     if IS_WIN:
+        launcher = HERE / "start-oracle-hidden.vbs"
+        if launcher.is_file():
+            # The launcher starts Oracle without a window and says so if it doesn't start.
+            return ('Set sh = CreateObject("WScript.Shell")\r\n'
+                    f'sh.Run "wscript.exe ""{launcher}"" --no-browser", 0, False\r\n')
         pyw = Path(sys.executable).with_name("pythonw.exe")
         exe = str(pyw if pyw.exists() else Path(sys.executable))
         return ('Set sh = CreateObject("WScript.Shell")\r\n'
@@ -2934,8 +2939,25 @@ def cmd_config(args) -> int:
     return 0
 
 
+def launcher_copies(folder: Path) -> list:
+    """Copies of start-oracle-hidden.vbs in the Startup folder (a shortcut, .lnk, is fine)."""
+    try:
+        return sorted(p for p in folder.iterdir()
+                      if p.suffix.lower() == ".vbs" and p.name.lower().startswith("start-oracle-hidden"))
+    except OSError:
+        return []
+
+
+def warn_about_launcher_copies(folder: Path) -> None:
+    for p in launcher_copies(folder):
+        say(f"Delete {p}: it is a copy of start-oracle-hidden.vbs, which only works from the oracle2")
+        say("folder. `autostart on` starts Oracle at login without it.")
+
+
 def cmd_autostart(args) -> int:
     target = autostart_file()
+    if IS_WIN:
+        warn_about_launcher_copies(target.parent)
     if args.action == "status":
         say(f"Autostart is {'on' if target.exists() else 'off'} ({target})")
         return 0
@@ -2945,7 +2967,13 @@ def cmd_autostart(args) -> int:
         say(f"Autostart is off (removed {target}).")
         return 0
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(autostart_content(), encoding="utf-8")
+    content = autostart_content()
+    if IS_WIN:
+        # Windows Script Host reads a .vbs as ANSI, or as UTF-16 with a BOM: UTF-16 keeps
+        # a folder name such as C:\Users\Fopè intact. Bytes, so the line ends stay \r\n.
+        target.write_bytes(("\ufeff" + content).encode("utf-16-le"))
+    else:
+        target.write_text(content, encoding="utf-8")
     cfg = load_config()
     db = resolve_db(None, cfg)
     say(f"Autostart is on: Oracle will start when you log in ({target}).")

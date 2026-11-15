@@ -764,6 +764,45 @@ class RegistryFileTest(unittest.TestCase):
             self.assertTrue(isinstance(a["port"], int) and 1024 < a["port"] < 65536, a["name"])
 
 
+class WindowsAutostartTest(TempDirCase):
+    """The Startup entry on Windows (built here by pretending to be Windows)."""
+
+    def test_it_runs_the_launcher_without_a_browser(self):
+        with mock.patch.object(oracle, "IS_WIN", True):
+            text = oracle.autostart_content()
+        self.assertIn(f'wscript.exe ""{ROOT / "start-oracle-hidden.vbs"}"" --no-browser", 0, False', text)
+        self.assertTrue(text.endswith("\r\n"))
+        self.assertNotIn("\r\r", text)
+
+    def test_written_as_utf16_so_any_folder_name_survives(self):
+        here = self.tmp / "Fopè" / "oracle2"                                  # an accented folder name
+        write(here / "start-oracle-hidden.vbs", "")
+        target = self.tmp / "Startup" / "Oracle atlases.vbs"
+        args = oracle.build_parser().parse_args(["autostart", "on"])
+        with mock.patch.object(oracle, "IS_WIN", True), mock.patch.object(oracle, "HERE", here), \
+                mock.patch.object(oracle, "autostart_file", return_value=target), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(oracle.cmd_autostart(args), 0)
+        data = target.read_bytes()
+        self.assertTrue(data.startswith(b"\xff\xfe"))                       # UTF-16 LE with a BOM
+        text = data[2:].decode("utf-16-le")
+        self.assertIn("Fopè", text)
+        self.assertEqual(text.count("\r\n"), text.count("\n"))
+
+    def test_copies_of_the_launcher_in_the_startup_folder_are_pointed_out(self):
+        startup = self.tmp / "Startup"
+        write(startup / "start-oracle-hidden.vbs", "")
+        write(startup / "start-oracle-hidden - Copy.VBS", "")
+        write(startup / "start-oracle-hidden.vbs.lnk", "")                    # a shortcut is fine
+        write(startup / "Oracle atlases.vbs", "")
+        self.assertEqual([p.name for p in oracle.launcher_copies(startup)],
+                         ["start-oracle-hidden - Copy.VBS", "start-oracle-hidden.vbs"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            oracle.warn_about_launcher_copies(startup)
+        self.assertIn("Delete", out.getvalue())
+
+
 class HiddenStarterTest(TempDirCase):
     """start-oracle-hidden.vbs runs only on Windows, so this checks what it relies on:
     the port in oracle.config.json and the dashboard's answer, matched with its own patterns."""
@@ -779,8 +818,12 @@ class HiddenStarterTest(TempDirCase):
     def test_plain_ascii_with_windows_line_ends_and_no_window(self):
         text = self.VBS.read_text(encoding="ascii")          # VBScript files are read as ANSI
         self.assertIn("*.vbs text eol=crlf", (ROOT / ".gitattributes").read_text())
-        self.assertIn('& " start" & args, 0, False', text)   # window style 0: hidden; don't wait
         self.assertIn('python = "pyw -3"', text)
+        # through cmd, so Python's own errors reach the log; window style 0: hidden; don't wait
+        self.assertIn('sh.Run "cmd /c """ & python & " " & Quote(here & "\\oracle.py") & " start" & args', text)
+        self.assertIn('" >> " & Quote(logPath) & " 2>&1""", 0, False', text)
+        # a copy outside the oracle2 folder says so instead of waiting for nothing
+        self.assertIn('If Not fso.FileExists(here & "\\oracle.py") Then', text)
 
     def test_it_finds_the_port_and_recognises_the_dashboard(self):
         cfg = oracle.load_config()
